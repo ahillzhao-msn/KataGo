@@ -66,3 +66,5 @@ namespace Version {
   std::string getGitRevision();
   std::string getGitRevisionWithBackend();
 }
+
+int extract_features(const std::vector<std::string>& subArgs);
