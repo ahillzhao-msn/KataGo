@@ -466,6 +466,12 @@ NNOutput& NNOutput::operator=(const NNOutput& other) {
   else
     noisedPolicyProbs = NULL;
 
+  // trunk and pick are large allocations; operator= intentionally drops them
+  // (callers use shared_ptr<NNOutput> — assignment is rare and trunk ownership
+  //  should not be silently copied; free the old buffers to avoid leaking them)
+  if(trunk != NULL) { delete[] trunk; trunk = NULL; }
+  if(pick  != NULL) { delete[] pick;  pick  = NULL; }
+
   std::copy(other.policyProbs, other.policyProbs+NNPos::MAX_NN_POLICY_SIZE, policyProbs);
   policyOptimismUsed = other.policyOptimismUsed;
 
