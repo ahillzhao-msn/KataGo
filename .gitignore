@@ -22,3 +22,5 @@ release/
 # Environment-specific (not committed)
 cpp/KataGoData/
 release/
+
+cpp/analysis_config_opt.cfg
