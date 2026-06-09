@@ -4290,9 +4290,8 @@ void NeuralNet::getOutput(
     output->whiteLossProb = inputBuffers->valueResults[row * numValueChannels + 1];
     output->whiteNoResultProb = inputBuffers->valueResults[row * numValueChannels + 2];
 
-    // Copy trunk features
-    // (always reads if trunkResults available; minimal perf impact)
-    if(inputBuffers->trunkResults != NULL) {
+    // Copy trunk features — only when the caller requested them
+    if(output->includeTrunk && inputBuffers->trunkResults != NULL) {
       int trunkCh = gpuHandle->model->trunk->trunkNumChannels;
       int trunkSpatial = nnXLen * nnYLen;
       const float* trunkSrc = inputBuffers->trunkResults + row * trunkCh * trunkSpatial;

@@ -459,6 +459,17 @@ int batch_analysis(const vector<string>& args) {
       auto& moves = sgf->moves;
       if((int)moves.size() < minMoves) { skipped++; continue; }
 
+    // Validate alternation: reject SGFs with consecutive same-color moves
+    bool altValid = true;
+    for(size_t mi = 1; mi < moves.size(); mi++) {
+      if(moves[mi].pla == moves[mi-1].pla) { altValid = false; break; }
+    }
+    if(!altValid) {
+      // Reject SGFs with consecutive same-color moves (IGS/OGS format issue)
+      cerr << "  Skipping non-alternating SGF: " << entry.sgfPath << endl;
+      failed++; continue;
+    }
+
       Rules rules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
       Board board;
       BoardHistory history;
