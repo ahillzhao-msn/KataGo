@@ -127,6 +127,10 @@ struct NNOutput {
   //Initially from the perspective of the player to move at the time of the eval, fixed up later in nnEval.cpp
   //to be the value from white's perspective.
   //These three are categorial probabilities for each outcome.
+  bool includeTrunk = false;
+  bool includePick = false;
+  float* trunk = NULL;   // trunk features (trunkNumChannels * nnXLen * nnYLen)
+  float* pick = NULL;    // trunk features at move position (trunkNumChannels)
   float whiteWinProb;
   float whiteLossProb;
   float whiteNoResultProb;

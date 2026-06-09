@@ -57,6 +57,7 @@ namespace MainCmds {
   int searchentropyanalysis(const std::vector<std::string>& args);
 
   int sandbox();
+int batch_analysis(const std::vector<std::string>& subArgs);
 }
 
 namespace Version {
@@ -67,4 +68,4 @@ namespace Version {
   std::string getGitRevisionWithBackend();
 }
 
-int extract_features(const std::vector<std::string>& subArgs);
+int batch_analysis(const std::vector<std::string>& subArgs);
