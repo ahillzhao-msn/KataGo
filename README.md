@@ -1,6 +1,7 @@
 # KataGo — Trunk Feature Extraction Fork
 
-This fork extends [lightvector/KataGo](https://github.com/lightvector/KataGo) with trunk feature extraction for Go strength evaluation models. Changes are minimal (+28 lines across 5 files) for easy upstream merging.
+This fork extends [lightvector/KataGo](https://github.com/lightvector/KataGo) with trunk feature extraction for Go strength evaluation models.  
+**Version: v1.16.5-trunk** | OpenCL + CUDA backends | Zlib-compressed NPZ output Changes are minimal (+28 lines across 5 files) for easy upstream merging.
 
 ## Added
 
@@ -15,15 +16,49 @@ This fork extends [lightvector/KataGo](https://github.com/lightvector/KataGo) wi
 # First-time GPU setup
 ./katago tuner -config analysis_config.cfg -model model.bin.gz
 
-# Batch analysis
+# Batch analysis (default: zlib-compressed NPZ output)
 ./katago batch_analysis \
   -config analysis_config.cfg \
   -model model.bin.gz \
   -list games.csv \
   -output-dir ./features/
 
-# Output: game_XXXX_B.npz, game_XXXX_W.npz, _meta.csv
+# Uncompressed output (debug/development)
+./katago batch_analysis \
+  -config analysis_config.cfg \
+  -model model.bin.gz \
+  -list games.csv \
+  -output-dir ./features/ \
+  -no-compress
+
+# Output:
+#   game_XXXX_B.npz   ← Black player features (compressed by default)
+#   game_XXXX_W.npz   ← White player features
+#   _meta.csv          ← Game metadata
 # Each NPZ: head[12] + trunk[256] + pick[256] per move
+# Compression ratio: ~80x on real data
+```
+
+## NPZ Format
+
+```
+Header (20 bytes): [KABN:4][num_moves:4][head_dim:4][trunk_dim:4][flags:4]
+  flags & 1 = zlib compressed
+
+If compressed (flags & 1):
+  [compressed_size:4][zlib_data:compressed_size]
+
+Data layout (per move): head[12] + trunk[256] + pick[256] = 524 floats = 2096 bytes
+
+Python:
+  import zlib, struct, numpy as np
+  with open('game.npz','rb') as f:
+    magic, n, hd, tk, flags = struct.unpack('4siiii', f.read(20))
+    raw = f.read()
+    if flags & 1:
+      cl = struct.unpack('i', raw[:4])[0]
+      raw = zlib.decompress(raw[4:4+cl])
+    arr = np.frombuffer(raw, dtype=np.float32).reshape(n, hd+tk+tk)
 ```
 
 ## Upgrade

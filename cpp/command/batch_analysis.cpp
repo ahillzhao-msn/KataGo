@@ -29,8 +29,13 @@
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/modelversion.h"
 #include "../main.h"
+#include <zlib.h>
 
 using namespace std;
+
+
+
+
 
 namespace MainCmds {
 
@@ -159,6 +164,7 @@ int batch_analysis(const vector<string>& args) {
   int maxGames = 0;        // 0 = all
   bool headOnly = false;   // only output 12-dim head features
   bool trunkOnly = false;  // only output 256-dim trunk features
+  bool noCompress = false; // default: zlib compress output
 
   for(size_t i = 1; i < args.size(); i++) {
     if(args[i] == "-config" && i+1 < args.size()) { configFile = args[++i]; }
@@ -171,6 +177,7 @@ int batch_analysis(const vector<string>& args) {
     else if(args[i] == "-max-games" && i+1 < args.size()) { maxGames = stoi(args[++i]); }
     else if(args[i] == "-head-only") { headOnly = true; }
     else if(args[i] == "-trunk-only") { trunkOnly = true; }
+    else if(args[i] == "-no-compress") { noCompress = true; }
     else { cerr << "Unknown: " << args[i] << endl; return 1; }
   }
 
@@ -207,6 +214,8 @@ int batch_analysis(const vector<string>& args) {
   Logger logger;
   Rand seedRand;
   ConfigParser cfg = configFile.empty() ? ConfigParser() : ConfigParser(configFile);
+  Setup::initializeSession(cfg);
+  Board::initHash();  // init Zobrist tables
   int nnXLen = 19, nnYLen = 19;
   int defaultMaxBatch = 64;  // nnMaxBatchSize in config overrides this
   auto nnEval = Setup::initializeNNEvaluator(
@@ -300,18 +309,48 @@ int batch_analysis(const vector<string>& args) {
     }
 
     // Write NPZ per player
-    auto writeNPZ = [&](const vector<MoveRecord>& records, const string& suffix) {
-      if((int)records.size() < 5) return;
-      NPZHeader hdr;
-      hdr.numMoves = (int32_t)records.size();
-      string path = outputDir + "/" + base + suffix + ".npz";
-      ofstream out(path, ios::binary);
-      if(!out) return;
-      out.write((const char*)&hdr, sizeof(hdr));
-      out.write((const char*)records.data(), records.size() * sizeof(MoveRecord));
-    };
-    writeNPZ(blackRecords, "_B");
-    writeNPZ(whiteRecords, "_W");
+    {
+      auto& records = blackRecords;
+      if((int)records.size() >= 5) {
+        string outpath = outputDir + "/" + base + "_B.npz";
+        ofstream out(outpath, ios::binary);
+        if(out) {
+          int n = (int)records.size(), hd = 12, tk = 256, flags = noCompress ? 0 : 1;
+          out.write("KABN", 4);
+          out.write((const char*)&n, 4); out.write((const char*)&hd, 4);
+          out.write((const char*)&tk, 4); out.write((const char*)&flags, 4);
+          size_t raw = records.size() * sizeof(MoveRecord);
+          if(noCompress) {
+            out.write((const char*)records.data(), raw);
+          } else { uLongf cl = compressBound(raw); vector<char> cb(cl);
+            if(compress((Bytef*)cb.data(), &cl, (const Bytef*)records.data(), raw) == Z_OK)
+              { out.write((const char*)&cl, 4); out.write(cb.data(), cl); }
+            else { int z=0; out.write((const char*)&z,4); out.write((const char*)records.data(), raw); }
+          }
+        }
+      }
+    }
+    {
+      auto& records = whiteRecords;
+      if((int)records.size() >= 5) {
+        string outpath = outputDir + "/" + base + "_W.npz";
+        ofstream out(outpath, ios::binary);
+        if(out) {
+          int n = (int)records.size(), hd = 12, tk = 256, flags = noCompress ? 0 : 1;
+          out.write("KABN", 4);
+          out.write((const char*)&n, 4); out.write((const char*)&hd, 4);
+          out.write((const char*)&tk, 4); out.write((const char*)&flags, 4);
+          size_t raw = records.size() * sizeof(MoveRecord);
+          if(noCompress) {
+            out.write((const char*)records.data(), raw);
+          } else { uLongf cl = compressBound(raw); vector<char> cb(cl);
+            if(compress((Bytef*)cb.data(), &cl, (const Bytef*)records.data(), raw) == Z_OK)
+              { out.write((const char*)&cl, 4); out.write(cb.data(), cl); }
+            else { int z=0; out.write((const char*)&z,4); out.write((const char*)records.data(), raw); }
+          }
+        }
+      }
+    }
 
     // Write metadata CSV (one line per game)
     if(gi == 0) {
