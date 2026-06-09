@@ -721,11 +721,12 @@ batch_analysis（本 fork，修复后）
 **新增功能：**
 
 - `PlayerAcc` 累加器：`addMove()` + `addDelta()` + `toSummary()`，Welford 在线方差
-- `PlayerSummary` 嵌入 NPZHeader（10项指标，64 bytes）
+- `PlayerSummary` 嵌入 NPZHeader（12项指标，64 bytes；含 `humanRankIdx`/`humanLogPrior`）
 - `winDelta` / `scoreDelta` 延迟回填机制（turn t+1 知道 t 的 delta 后填入）
 - `-sgf-dir` 实现：`FileUtils::collectFiles()` 扫描 `.sgf` 文件
-- `_meta.csv` 包含双方全部 `PlayerSummary` 字段
-- `-human-model` 参数已解析，留作后续 HumanSL 二阶段集成
+- `_meta.csv` 包含双方全部 `PlayerSummary` 字段及 HumanSL 结果列
+- **[已实现] HumanSL 二阶段**：`-human-model` 加载第二个 `NNEvaluator`，对每局每棋手查询 3 个候选段位，选最大 log-likelihood 档位，结果写入 `PlayerSummary.humanRankIdx`/`humanLogPrior` 及 `_meta.csv`
+- **[Bug 修复] Pick 第一手为零**：改为从 `nn->trunk` 直接提取 `trunk[ch * spatial + rowPos]`（NCHW），不再依赖 `includePick` 后端路径（该路径在首次 eval 时可能返回全零）
 
 ### 12.3 当前可用状态
 
@@ -735,12 +736,17 @@ $ katago batch_analysis \
     -list games.csv \
     -output-dir out/
 
+# 无 HumanSL
 batch-analysis: 1 games  trunkCh=384  moveDim=778  headerBytes=96  output=out/
 
+# 加 HumanSL（每局额外 ~0.4s）
+$ katago batch_analysis -model ... -human-model humansl.bin.gz -list games.csv -output-dir out/
+batch-analysis: 1 games  trunkCh=384  moveDim=778  headerBytes=96  [+HumanSL x3]  output=out/
+
 输出：
-  out/game_0000000000000000_B.npz   ← KAB2 格式，包含 PlayerSummary
+  out/game_0000000000000000_B.npz   ← KAB2 格式，PlayerSummary 含 humanRankIdx
   out/game_0000000000000000_W.npz
-  out/_meta.csv
+  out/_meta.csv                     ← 含 B_humanRank、W_humanRank 列
 ```
 
 ---
@@ -750,7 +756,7 @@ batch-analysis: 1 games  trunkCh=384  moveDim=778  headerBytes=96  output=out/
 ### 13.1 NPZHeader（96 bytes）
 
 ```cpp
-// PlayerSummary：10 项聚合统计，64 bytes
+// PlayerSummary：12 项聚合统计，64 bytes
 struct PlayerSummary {
   float accuracy1;        // 落子与 KataGo top-1 一致率
   float accuracy3;        // 落子在 KataGo top-3 内的比率
@@ -762,7 +768,9 @@ struct PlayerSummary {
   float approxScoreDrop;  // mean(max(0, -playerWinDelta)) — 失误代理
   float meanWinDelta;     // mean 签名胜率变化（玩家视角）
   float meanScoreDelta;   // mean 签名得分变化（玩家视角，points）
-  float reserved[6];      // 保留，共 16 × 4 = 64 bytes
+  float humanRankIdx;     // HumanSL 最匹配段位索引（0=20k…28=9d），-1 表示未计算
+  float humanLogPrior;    // 最佳 HumanSL 档位下的 meanLogPrior
+  float reserved[4];      // 保留，共 16 × 4 = 64 bytes
 };
 
 #pragma pack(push, 1)
@@ -800,6 +808,42 @@ Scalars 索引（白方视角统一）：
 [5] policyPrior         [6] policyRank/361   [7] isWhite
 [8] winDelta            [9] scoreDelta/50
 ```
+
+### 13.2.1 向量长度：文件内固定，文件间可变
+
+> **关键设计决策**（勿改为可变长格式）
+
+`moveDim = 10 + 2 × trunkCh` 在同一文件内**严格固定**——因为一个文件只来自一个模型的一次分析，`trunkCh` 不会中途变化。但若混合来自不同模型架构的文件（如 b18c384 vs b28c512），则不同文件的 `moveDim` 不同（778 vs 1034）。
+
+**为什么不改为可变长 + 零填充？**
+
+- 零填充在格式上可行（PyTorch `collate_fn` 一行搞定），但**语义上错误**：b18c384 的第 217 通道与 b28c512 的第 217 通道是完全不同的表征，强行对齐只会引入噪声
+- `trunkCh` 不同的 trunk 向量**本质上不可比**，不能共享同一组权重
+
+**正确的跨模型对齐方式：投影头路由**
+
+```python
+# 训练管线：按 trunkDim 分组，各架构接独立线性投影
+trunk_projections = {
+    384: nn.Linear(384, 128),   # b18c384nbt
+    512: nn.Linear(512, 128),   # b28c512nbt
+}
+
+for npz_path in dataset:
+    hdr = read_header(npz_path)          # 读取 96-byte NPZHeader
+    trunk_dim = hdr["trunkDim"]
+    proj = trunk_projections[trunk_dim]  # 路由到对应投影头
+    emb = proj(trunk_features)           # [N, trunkDim] → [N, 128]
+    # 128-dim embedding 之后统一训练，共享所有上层权重
+```
+
+| 方案 | 实现复杂度 | 语义正确性 |
+|------|-----------|-----------|
+| 零填充到最大 moveDim | 低 | **错误**（通道不可比） |
+| 可变长格式 + offset table | 高 | 正确但无必要 |
+| **文件内固定长 + 投影头路由** | 低 | **正确**（推荐） |
+
+**结论**：KAB2 格式保持现状（文件内固定，header 记录尺寸）；跨模型对齐由训练时的**架构特定投影层**处理。
 
 ### 13.3 PlayerAcc 累加器逻辑（C++）
 
@@ -851,11 +895,13 @@ def load_kab2(path):
 
     return scalars, pick, avg_trunk, summary
 
-# PlayerSummary 字段索引
+# PlayerSummary 字段索引（共 16 floats，后 4 个为 reserved）
 SUMMARY_FIELDS = [
     'accuracy1', 'accuracy3', 'meanLogPrior', 'meanWinRate',
     'meanScoreLead', 'meanComplexity', 'scoreVariance', 'approxScoreDrop',
     'meanWinDelta', 'meanScoreDelta',
+    'humanRankIdx',    # 0-28（20k→9d），-1 表示未启用 HumanSL
+    'humanLogPrior',   # 最佳档位的 mean log-likelihood
 ]
 
 # Scalars 字段索引（用于下游模型）
@@ -868,14 +914,42 @@ SUMMARY_FIELDS = [
 ```
 file, black, white, black_elo, white_elo, total_moves, black_moves, white_moves, set,
 B_acc1, B_acc3, B_logPrior, B_winRate, B_scoreLead, B_complexity, B_scoreVar, B_drop,
-W_acc1, W_acc3, W_logPrior, W_winRate, W_scoreLead, W_complexity, W_scoreVar, W_drop
+B_humanRank, B_humanLogPrior,
+W_acc1, W_acc3, W_logPrior, W_winRate, W_scoreLead, W_complexity, W_scoreVar, W_drop,
+W_humanRank, W_humanLogPrior
 ```
 
-`B_logPrior` 即黑方 `meanLogPrior`，是每局棋力的核心指标，可直接用于排序和分组。
+- `B_logPrior`：黑方 `meanLogPrior`，核心强度指标，可直接用于排序和分组
+- `B_humanRank`：HumanSL 最匹配段位字符串（如 `"rank_3d"`），未启用 `-human-model` 时为 `"?"`
+- `B_humanLogPrior`：该段位档位下的平均 log-likelihood，值越大越匹配
 
 ---
 
 ## 十四、HumanSL 集成策略与开销分析
+
+> **状态：已实现（batch_analysis.cpp v3）**
+> 通过 `-human-model` 参数启用。对每局每棋手，先用主模型 meanLogPrior 估算候选段位范围，
+> 再调用 HumanSL 模型查询 3 个候选段位，最终结果写入 `PlayerSummary.humanRankIdx`。
+
+### 14.0 实际实现概要
+
+```
+流程（每局）
+  1. 主模型前向传播 → 聚合 meanLogPrior（B/W 分别）
+  2. rankCandidates(logPrior)
+       t = clamp((logPrior + 5.9) / 5.4, 0, 1)
+       mid = clamp(round(t * 28), 1, 27)
+       candidates = [mid-1, mid, mid+1]   ← 3 个相邻段位索引
+  3. runHumanSLPass()：重播棋谱，每手棋对当前棋手的 3 候选分别调用 humanEval
+       hbuf.includeTrunk = false   ← 仅需 policy head
+       humanEval->evaluate(board, history, pla, &meta, ...)
+       sumLog[k] += log(policyProbs[rowPos])
+  4. 选最大 log-likelihood 候选 → 写入 PlayerSummary.humanRankIdx / humanLogPrior
+  5. _meta.csv 追加 B_humanRank / W_humanRank 列
+```
+
+段位索引 ↔ 字符串映射（共 29 档）：
+`0="rank_20k"  1="rank_19k"  ...  19="rank_1k"  20="rank_1d"  ...  28="rank_9d"`
 
 ### 14.1 纯 KataGo 分析即可得到每棋手本盘得分
 
