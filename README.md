@@ -1,3 +1,32 @@
+# KataGo — Trunk Feature Extraction Fork
+
+This is a fork of [lightvector/KataGo](https://github.com/lightvector/KataGo) with added trunk feature extraction for Go strength models. All three inference backends (CUDA, OpenCL, Eigen) support `includeTrunk`/`includePick`.
+
+## What's added
+
+- **`extract_features` command** — extracts trunk (256-dim), pick, and head features from SGFs
+- **`strmodel/`** — Precompute + Dataset infrastructure (adapted from [Animiral/go-strength-model](https://github.com/Animiral/go-strength-model))
+- **Binary output (NPZ)** by default; CSV via `--csv` flag
+- **Multi-backend trunk**: CUDA `cudaMemcpy`, OpenCL `clEnqueueReadBuffer`, Eigen direct copy
+
+## Quick start
+
+```bash
+./katago extract_features -model model.bin.gz -list games.csv -feature-dir cache
+# Or CSV format:
+./katago extract_features -model model.bin.gz -list games.csv -feature-dir cache --csv
+```
+
+## Fork credits
+
+- Original: [lightvector/KataGo](https://github.com/lightvector/KataGo)
+- Strength model concept: [Animiral/go-strength-model](https://github.com/Animiral/go-strength-model)
+- Fork: [ahillzhao-msn/KataGo](https://github.com/ahillzhao-msn/KataGo)
+
+---
+
+*Original KataGo README follows below:*
+
 # KataGo
 
 * [Overview](#overview)
