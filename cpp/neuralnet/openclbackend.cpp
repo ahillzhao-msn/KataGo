@@ -3858,6 +3858,7 @@ struct InputBuffers {
   float* userInputGlobalBuffer; //Host pointer
   float* userInputMetaBuffer; //Host pointer
 
+  float* trunkResults; //Trunk output buffer (host)
   float* policyPassResults; //Host pointer
   float* policyResults; //Host pointer
   half_t* policyResultsHalf; //Host pointer
@@ -3908,6 +3909,7 @@ struct InputBuffers {
     policyResults = new float[(size_t)maxBatchSize * m.numPolicyChannels * nnXLen * nnYLen];
     policyResultsHalf = new half_t[(size_t)maxBatchSize * m.numPolicyChannels * maxPaddedNNXYLen];
     valueResults = new float[(size_t)maxBatchSize * m.numValueChannels];
+    trunkResults = new float[(size_t)maxBatchSize * m.trunk.trunkNumChannels * nnXLen * nnYLen];
 
     scoreValueResults = new float[(size_t)maxBatchSize * m.numScoreValueChannels];
     ownershipResults = new float[(size_t)maxBatchSize * nnXLen * nnYLen * m.numOwnershipChannels];
@@ -3920,6 +3922,7 @@ struct InputBuffers {
     delete[] userInputGlobalBuffer;
     if(userInputMetaBuffer != NULL)
       delete[] userInputMetaBuffer;
+    delete[] trunkResults;
     delete[] policyPassResults;
     delete[] policyResults;
     delete[] policyResultsHalf;
@@ -4156,6 +4159,17 @@ void NeuralNet::getOutput(
     inputBuffers->singleValueResultElts*sizeof(float)*batchSize, inputBuffers->valueResults, 0, NULL, NULL
   );
   CHECK_ERR(err);
+
+  // Read trunk buffer from GPU for strength model
+  if(inputBuffers->trunkResults != NULL) {
+    err = clEnqueueReadBuffer(
+      handle->commandQueue, gpuHandle->buffers->trunk, blocking, 0,
+      (size_t)256 * nnXLen * nnYLen * batchSize * sizeof(float),
+      inputBuffers->trunkResults, 0, NULL, NULL
+    );
+    CHECK_ERR(err);
+  }
+
   err = clEnqueueReadBuffer(
     handle->commandQueue, buffers->scoreValue, blocking, 0,
     inputBuffers->singleScoreValueResultElts*sizeof(float)*batchSize, inputBuffers->scoreValueResults, 0, NULL, NULL

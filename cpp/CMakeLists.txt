@@ -366,6 +366,7 @@ add_executable(katago
   command/startposes.cpp
   command/tune.cpp
   command/writetrainingdata.cpp
+  command/batch_analysis.cpp
   main.cpp
   )
 

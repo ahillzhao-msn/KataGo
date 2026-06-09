@@ -1,32 +1,45 @@
 # KataGo — Trunk Feature Extraction Fork
 
-This is a fork of [lightvector/KataGo](https://github.com/lightvector/KataGo) with added trunk feature extraction for Go strength models. All three inference backends (CUDA, OpenCL, Eigen) support `includeTrunk`/`includePick`.
+This fork extends [lightvector/KataGo](https://github.com/lightvector/KataGo) with trunk feature extraction for Go strength evaluation models. Changes are minimal (+28 lines across 5 files) for easy upstream merging.
 
-## What's added
+## Added
 
-- **`extract_features` command** — extracts trunk (256-dim), pick, and head features from SGFs
-- **`strmodel/`** — Precompute + Dataset infrastructure (adapted from [Animiral/go-strength-model](https://github.com/Animiral/go-strength-model))
-- **Binary output (NPZ)** by default; CSV via `--csv` flag
-- **Multi-backend trunk**: CUDA `cudaMemcpy`, OpenCL `clEnqueueReadBuffer`, Eigen direct copy
+| Component | Description | Files Changed |
+|-----------|-------------|---------------|
+| **`batch_analysis` command** | Batch SGF analysis: extract head(12-dim) + trunk(256-dim) + pick(256-dim) features. NPZ binary output. | `command/batch_analysis.cpp` (new) |
+| **Trunk/Pick output** | `includeTrunk`/`includePick` flags in NNOutput; OpenCL backend reads trunk buffer from GPU via `clEnqueueReadBuffer` | `nninputs.h` (+4), `openclbackend.cpp` (+20) |
 
-## Quick start
+## Quick Start
 
 ```bash
-./katago extract_features -model model.bin.gz -list games.csv -feature-dir cache
-# Or CSV format:
-./katago extract_features -model model.bin.gz -list games.csv -feature-dir cache --csv
+# First-time GPU setup
+./katago tuner -config analysis_config.cfg -model model.bin.gz
+
+# Batch analysis
+./katago batch_analysis \
+  -config analysis_config.cfg \
+  -model model.bin.gz \
+  -list games.csv \
+  -output-dir ./features/
+
+# Output: game_XXXX_B.npz, game_XXXX_W.npz, _meta.csv
+# Each NPZ: head[12] + trunk[256] + pick[256] per move
 ```
 
-## Fork credits
+## Upgrade
 
-- Original: [lightvector/KataGo](https://github.com/lightvector/KataGo)
-- Strength model concept: [Animiral/go-strength-model](https://github.com/Animiral/go-strength-model)
-- Fork: [ahillzhao-msn/KataGo](https://github.com/ahillzhao-msn/KataGo)
+See [docs/katago-customization.md](docs/katago-customization.md) for detailed upgrade strategy.
+
+## Credits
+
+- Original KataGo: [lightvector/KataGo](https://github.com/lightvector/KataGo)
+- Strength model inspiration: [Animiral/go-strength-model](https://github.com/Animiral/go-strength-model)
+- Preprocessing patterns: [ahillzhao-msn/go-analyzer](https://github.com/ahillzhao-msn/go-analyzer)
+- This fork: [ahillzhao-msn/KataGo](https://github.com/ahillzhao-msn/KataGo)
 
 ---
 
 *Original KataGo README follows below:*
-
 # KataGo
 
 * [Overview](#overview)
