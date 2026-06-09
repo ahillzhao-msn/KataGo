@@ -3,15 +3,22 @@
 build.bat
 cpp/Eigen/
 cpp/unsupported/
-cpp/analysis_logs/
-cpp/test_batch/
 cpp/eigen3/
 cpp/KataGoData/
-cpp/analysis_config_opt.cfg
+cpp/analysis_logs/
+cpp/test_batch/
+cpp/test_output*
 cpp/CMakeCache.txt
 cpp/CMakeFiles/
 cpp/*.obj
-cpp/*.exe
 cpp/*.lib
 cpp/*.exp
 cpp/nmake*
+cpp/cmake_install.cmake
+cpp/Makefile
+cpp/program/gitinfo.h
+release/
+
+# Environment-specific (not committed)
+cpp/KataGoData/
+release/
