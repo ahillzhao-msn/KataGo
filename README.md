@@ -61,29 +61,8 @@ with open('game_B.npz','rb') as f:
 # Compression ratio: ~80x on real data
 ```
 
-## NPZ Format
+## KAB2 Format
 
-```
-Header (20 bytes): [KABN:4][num_moves:4][head_dim:4][trunk_dim:4][flags:4]
-  flags & 1 = zlib compressed
-
-If compressed (flags & 1):
-  [compressed_size:4][zlib_data:compressed_size]
-
-Data layout (per move): head[12] + trunk[256] + pick[256] = 524 floats = 2096 bytes
-
-Python:
-  import zlib, struct, numpy as np
-  with open('game.npz','rb') as f:
-    magic, n, hd, tk, flags = struct.unpack('4siiii', f.read(20))
-    raw = f.read()
-    if flags & 1:
-      cl = struct.unpack('i', raw[:4])[0]
-      raw = zlib.decompress(raw[4:4+cl])
-    arr = np.frombuffer(raw, dtype=np.float32).reshape(n, hd+tk+tk)
-```
-
-## Upgrade
 
 See [docs/katago-customization.md](docs/katago-customization.md) for detailed upgrade strategy.
 

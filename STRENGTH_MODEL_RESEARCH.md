@@ -726,7 +726,11 @@ batch_analysis（本 fork，修复后）
 - `-sgf-dir` 实现：`FileUtils::collectFiles()` 扫描 `.sgf` 文件
 - `_meta.csv` 包含双方全部 `PlayerSummary` 字段及 HumanSL 结果列
 - **[已实现] HumanSL 二阶段**：`-human-model` 加载第二个 `NNEvaluator`，对每局每棋手查询 3 个候选段位，选最大 log-likelihood 档位，结果写入 `PlayerSummary.humanRankIdx`/`humanLogPrior` 及 `_meta.csv`
-- **[Bug 修复] Pick 第一手为零**：改为从 `nn->trunk` 直接提取 `trunk[ch * spatial + rowPos]`（NCHW），不再依赖 `includePick` 后端路径（该路径在首次 eval 时可能返回全零）
+- **[机制已改] Pick 提取**：改为从 `nn->trunk` 直接提取 `trunk[ch * spatial + rowPos]`（NCHW），不再依赖 `includePick` 后端路径
+  - ⚠️ **待验证**：实测发现 pick 数据仍约 2-4/512 非零（几乎全零），有两个竞争假设：
+    - **假设 A（索引错误）**：backend 实际以 NHWC 存储 trunk，NCHW 假设导致读到错误位置；需对比 `avg_trunk` 与 `pick` 的非零通道分布来确认
+    - **假设 B（语义稀疏）**：落子点评估在落子**前**进行，是空点，经 ReLU 多层后激活天然极稀疏，pick 全零是正确行为但信息量低
+  - **当前状态**：**非 blocker**，KAB2 格式中 pick 字段已预留空间，scalar 和 avgTrunk 不受影响，训练管线可暂时忽略 pick 通道
 
 ### 12.3 当前可用状态
 
