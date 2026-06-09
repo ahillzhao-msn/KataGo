@@ -10,6 +10,28 @@ This fork extends [lightvector/KataGo](https://github.com/lightvector/KataGo) wi
 | **`batch_analysis` command** | Batch SGF analysis: extract head(12-dim) + trunk(256-dim) + pick(256-dim) features. NPZ binary output. | `command/batch_analysis.cpp` (new) |
 | **Trunk/Pick output** | `includeTrunk`/`includePick` flags in NNOutput; OpenCL backend reads trunk buffer from GPU via `clEnqueueReadBuffer` | `nninputs.h` (+4), `openclbackend.cpp` (+20) |
 
+
+## Training Mode
+
+```bash
+katago batch_analysis \
+  -config analysis_config.cfg \
+  -model model.bin.gz \
+  -list games.csv \
+  -output-dir ./features/ \
+  -training
+
+# Output: KABT format with full spatial trunk (128x19x19 per move)
+# Always zlib compressed. Python:
+import zlib, struct, numpy as np
+with open('game_B.npz','rb') as f:
+    n,hd,tk,pk,nx,ny,fl = struct.unpack('iiiiiii', f.read(28))
+    rec_bytes = n * 1072  # head(12)+pick(256) per move
+    cl = struct.unpack('i', f.read(4))[0]
+    trunk = zlib.decompress(f.read(cl))
+    arr = np.frombuffer(trunk, dtype=np.float32).reshape(n, tk, nx, ny)
+```
+
 ## Quick Start
 
 ```bash
@@ -68,8 +90,9 @@ See [docs/katago-customization.md](docs/katago-customization.md) for detailed up
 ## Credits
 
 - Original KataGo: [lightvector/KataGo](https://github.com/lightvector/KataGo)
-- Strength model inspiration: [Animiral/go-strength-model](https://github.com/Animiral/go-strength-model)
+- Strength model concept: [Animiral/go-strength-model](https://github.com/Animiral/go-strength-model)
 - Preprocessing patterns: [ahillzhao-msn/go-analyzer](https://github.com/ahillzhao-msn/go-analyzer)
+- Design & research: [STRENGTH_MODEL_RESEARCH.md](./STRENGTH_MODEL_RESEARCH.md) — comprehensive technical analysis covering trunk features, HumanSL integration, representation theory, scoring system design, and KAB2 format specification.
 - This fork: [ahillzhao-msn/KataGo](https://github.com/ahillzhao-msn/KataGo)
 
 ---

@@ -1,101 +1,124 @@
-// batch_analysis.cpp — Batch SGF analysis with trunk/pick/head feature extraction
-// Inspired by go-analyzer preprocessing pipeline (https://github.com/ahillzhao-msn/go-analyzer)
-// Key patterns adopted:
-//   - Main line only extraction (skip SGF branches)
-//   - Skip games with < 10 moves
-//   - Per-file error tolerance (catch & continue)
-//   - Binary NPZ output with metadata
-//   - Batch directory scanning
-//   - Progress reporting
+// batch_analysis.cpp — Batch SGF analysis with per-move + per-game feature extraction
+//
+// Output format KAB2 (per-player files _B.npz / _W.npz):
+//   NPZHeader (96 bytes, embeds PlayerSummary) |
+//   [ scalars(10) + pick(C) + avgTrunk(C) ] × N  [optionally zlib]
+//
+// Scalars layout — white's perspective throughout:
+//   [0] whiteWinProb    [1] whiteLossProb   [2] whiteNoResultProb
+//   [3] whiteScoreMean/50  [4] shorttermScoreError/10
+//   [5] policyPrior  [6] policyRank/361  [7] isWhite
+//   [8] winDelta    (whiteWinProb[t+1]  - whiteWinProb[t],   deferred fill)
+//   [9] scoreDelta/50 (whiteScoreMean[t+1] - whiteScoreMean[t], deferred fill)
 
 #include "batch_analysis.h"
 
-#include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <ctime>
+#include <direct.h>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <cmath>
-#include <direct.h>
-#include <ctime>
 
-#include "../core/global.h"
 #include "../core/config_parser.h"
 #include "../core/fileutils.h"
+#include "../core/global.h"
 #include "../dataio/sgf.h"
-#include "../program/setup.h"
-#include "../program/play.h"
-#include "../command/commandline.h"
-#include "../neuralnet/nneval.h"
-#include "../neuralnet/modelversion.h"
 #include "../main.h"
+#include "../neuralnet/modelversion.h"
+#include "../neuralnet/nneval.h"
+#include "../program/play.h"
+#include "../program/setup.h"
 #include <zlib.h>
 
 using namespace std;
 
-
-
-
-
 namespace MainCmds {
 
-// ─── NPZ binary format ──────────────────────────────────────────
-// Compact binary format: header + interleaved float arrays
-// Layout:
-//   [magic:4] = "KABN" (KataGo Analysis Batch NPZ)
-//   [num_moves:4][num_head:4]=12[num_trunk:4]=256[num_pick:4]=256
-//   For each move: [head:48B][trunk:1024B][pick:1024B]
-// Total per move: 2096 bytes
+static const int SCALAR_DIM = 10;
 
-static const int HEAD_DIM = 12;
-static const int TRUNK_DIM = 256;
-static const int PICK_DIM = 256;
-static const int BYTES_PER_MOVE = 2096;  // (12 + 256 + 256) * 4
+// ─── Per-player aggregate statistics (embedded in NPZHeader) ──────────
+
+struct PlayerSummary {
+  float accuracy1;        // fraction top-1 match (rank == 0)
+  float accuracy3;        // fraction top-3 match (rank <= 2)
+  float meanLogPrior;     // mean log(policyPrior) — log-likelihood strength signal
+  float meanWinRate;      // mean player win probability across their moves
+  float meanScoreLead;    // mean player score lead (points, player's perspective)
+  float meanComplexity;   // mean shorttermScoreError
+  float scoreVariance;    // variance of player score lead (Welford online)
+  float approxScoreDrop;  // mean max(0, -playerWinDelta) — mistake proxy
+  float meanWinDelta;     // mean signed win delta (player's perspective)
+  float meanScoreDelta;   // mean signed score delta (player's perspective, points)
+  float reserved[6];      // pad to 16 floats = 64 bytes
+};
 
 #pragma pack(push, 1)
 struct NPZHeader {
-  char magic[4] = {'K','A','B','N'};
+  char magic[4];         // "KAB2"
   int32_t numMoves;
-  int32_t headDim = HEAD_DIM;
-  int32_t trunkDim = TRUNK_DIM;
-  int32_t pickDim = PICK_DIM;
+  int32_t scalarDim;     // SCALAR_DIM = 10
+  int32_t trunkDim;      // avg-pooled trunk channels
+  int32_t pickDim;       // pick channels (= trunkDim)
+  int32_t nnXLen;
+  int32_t nnYLen;
+  int32_t flags;         // bit0 = zlib compressed
+  PlayerSummary summary; // 64 bytes
 };
-struct MoveRecord {
-  float head[HEAD_DIM];
-  float trunk[TRUNK_DIM];
-  float pick[PICK_DIM];
-};
+// Total: 4 + 7*4 + 64 = 96 bytes
 #pragma pack(pop)
 
-// ─── Per-game metadata ──────────────────────────────────────────
-struct GameMeta {
-  string blackName;
-  string whiteName;
-  double blackElo = 1500;
-  double whiteElo = 1500;
-  string result;         // "B+R", "W+0.5", etc.
-  string date;
-  string source;         // filename or URL
-  int numMoves = 0;
-  int analyzedMoves = 0;
+// ─── Accumulator → PlayerSummary ─────────────────────────────────────
+
+struct PlayerAcc {
+  int n = 0;
+  float sumTop1 = 0, sumTop3 = 0;
+  float sumLogPrior = 0;
+  float sumWinRate = 0, sumScoreLead = 0, sumComplexity = 0;
+  float sumWinDelta = 0, sumScoreDelta = 0, sumDrop = 0;
+  float wfMean = 0, wfM2 = 0;  // Welford online variance for score lead
+
+  void addMove(int rank, float policyPrior, float playerWinRate,
+               float playerScoreLead, float complexity) {
+    n++;
+    sumTop1       += (rank == 0) ? 1.0f : 0.0f;
+    sumTop3       += (rank <= 2) ? 1.0f : 0.0f;
+    sumLogPrior   += std::log(std::max(policyPrior, 1e-10f));
+    sumWinRate    += playerWinRate;
+    sumScoreLead  += playerScoreLead;
+    sumComplexity += complexity;
+    float d1 = playerScoreLead - wfMean;
+    wfMean += d1 / n;
+    wfM2   += d1 * (playerScoreLead - wfMean);
+  }
+
+  void addDelta(float playerWinDelta, float playerScoreDelta) {
+    sumWinDelta   += playerWinDelta;
+    sumScoreDelta += playerScoreDelta;
+    sumDrop       += std::max(0.0f, -playerWinDelta);
+  }
+
+  PlayerSummary toSummary() const {
+    PlayerSummary s = {};
+    if(n == 0) return s;
+    s.accuracy1       = sumTop1 / n;
+    s.accuracy3       = sumTop3 / n;
+    s.meanLogPrior    = sumLogPrior / n;
+    s.meanWinRate     = sumWinRate / n;
+    s.meanScoreLead   = sumScoreLead / n;
+    s.meanComplexity  = sumComplexity / n;
+    s.scoreVariance   = (n > 1) ? wfM2 / (n - 1) : 0.0f;
+    s.approxScoreDrop = sumDrop / n;
+    s.meanWinDelta    = sumWinDelta / n;
+    s.meanScoreDelta  = sumScoreDelta / n;
+    return s;
+  }
 };
 
-// ─── Utility ─────────────────────────────────────────────────────
-
-static void ensureDir(const string& path) {
-  _mkdir(path.c_str());
-}
-
-static string timestamp() {
-  time_t t = time(nullptr);
-  char buf[32];
-  struct tm tm;
-  localtime_s(&tm, &t);
-  strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
-  return string(buf);
-}
-
-// ─── SGF list parsing ───────────────────────────────────────────
+// ─── List entry ───────────────────────────────────────────────────────
 
 struct ListEntry {
   string sgfPath;
@@ -105,286 +128,348 @@ struct ListEntry {
   char set = 'T';
 };
 
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+static void ensureDir(const string& path) { _mkdir(path.c_str()); }
+
 static vector<ListEntry> parseList(const string& path) {
   vector<ListEntry> entries;
   ifstream in(path);
   if(!in) { cerr << "Cannot open list: " << path << endl; return entries; }
   string line;
-  getline(in, line); // skip header
+  getline(in, line);  // skip header
   while(getline(in, line)) {
     if(line.empty()) continue;
     stringstream ss(line);
     ListEntry e;
-    string field;
-    getline(ss, e.sgfPath, ',');
+    string f;
+    getline(ss, e.sgfPath,     ',');
     getline(ss, e.playerBlack, ',');
     getline(ss, e.playerWhite, ',');
-    getline(ss, field, ','); e.score = stod(field);
-    getline(ss, field, ','); e.blackElo = stod(field);
-    getline(ss, field, ','); e.whiteElo = stod(field);
-    getline(ss, field, ','); e.set = field.empty() ? 'T' : field[0];
+    getline(ss, f, ','); if(!f.empty()) e.score    = stod(f);
+    getline(ss, f, ','); if(!f.empty()) e.blackElo = stod(f);
+    getline(ss, f, ','); if(!f.empty()) e.whiteElo = stod(f);
+    getline(ss, f, ','); e.set = f.empty() ? 'T' : f[0];
     entries.push_back(e);
   }
   return entries;
 }
 
-// ─── Extract head features from NNOutput ─────────────────────────
-
-static void extractHead(const NNOutput* nn, int rowPos, float* head, Player evalPla) {
-  // 12-dim features matching go-analyzer's AnalysisRecord format
-  const float wr = nn->whiteWinProb;
-  const float sl = (float)nn->whiteScoreMean;
-  const float prior = (rowPos >= 0 && rowPos < NNPos::MAX_NN_POLICY_SIZE) ? nn->policyProbs[rowPos] : 0.0f;
-
-  head[0] = 0.0f;                              // is_best (needs candidate list)
-  head[1] = 0.0f;                              // is_top5 (needs candidate list)
-  head[2] = 1.0f - prior;                      // complexity
-  head[3] = 0.5f;                               // policy_entropy (needs full distribution)
-  head[4] = prior;                               // policy_prior
-  head[5] = (evalPla == P_BLACK ? wr : 1.0f - wr); // winrate (from current player's perspective)
-  head[6] = (evalPla == P_BLACK ? sl : -sl) / 50.0f; // scoreLead normalized
-  head[7] = 0.1f;                               // scoreStdev (placeholder)
-  head[8] = 0.0f;                               // utility (needs search)
-  head[9] = 0.0f;                               // lcb (needs search)
-  head[10] = 0.05f;                             // visits_ratio (needs search)
-  head[11] = (evalPla == P_BLACK ? 0.0f : 1.0f); // player: 0=Black, 1=White
+static vector<char> zlibCompress(const char* data, size_t bytes) {
+  if(bytes == 0) return {};
+  uLongf clen = compressBound((uLong)bytes);
+  vector<char> out(clen);
+  if(compress((Bytef*)out.data(), &clen, (const Bytef*)data, (uLong)bytes) == Z_OK)
+    out.resize(clen);
+  else
+    out.assign(data, data + bytes);
+  return out;
 }
 
-// ═════════════════════════════════════════════════════════════════
-//  batch_analysis — Main command
-// ═════════════════════════════════════════════════════════════════
+static void writePlayerFile(
+  const string& path, const vector<float>& movesData,
+  int numMoves, int trunkCh, int nnXLen, int nnYLen,
+  bool doCompress, const PlayerSummary& summary
+) {
+  if(numMoves < 1) return;
+  ofstream out(path, ios::binary);
+  if(!out) { cerr << "Cannot write: " << path << endl; return; }
+
+  NPZHeader hdr;
+  memcpy(hdr.magic, "KAB2", 4);
+  hdr.numMoves  = (int32_t)numMoves;
+  hdr.scalarDim = (int32_t)SCALAR_DIM;
+  hdr.trunkDim  = (int32_t)trunkCh;
+  hdr.pickDim   = (int32_t)trunkCh;
+  hdr.nnXLen    = (int32_t)nnXLen;
+  hdr.nnYLen    = (int32_t)nnYLen;
+  hdr.flags     = doCompress ? 1 : 0;
+  hdr.summary   = summary;
+  out.write((const char*)&hdr, sizeof(hdr));
+
+  const char* raw  = (const char*)movesData.data();
+  size_t      rawB = movesData.size() * sizeof(float);
+  if(doCompress) {
+    vector<char> comp = zlibCompress(raw, rawB);
+    int32_t clen = (int32_t)comp.size();
+    out.write((const char*)&clen, 4);
+    out.write(comp.data(), clen);
+  } else {
+    out.write(raw, rawB);
+  }
+}
+
+// Append one move's feature block.  Scalars[8,9] = 0 (deferred delta fill).
+// policyPrior and rank are pre-computed by the caller to avoid duplication.
+static void appendMoveRecord(
+  vector<float>& buf,
+  const NNOutput* nn, Player evalPla,
+  float policyPrior, int rank,
+  int trunkCh, int nnXLen, int nnYLen
+) {
+  buf.push_back(nn->whiteWinProb);
+  buf.push_back(nn->whiteLossProb);
+  buf.push_back(nn->whiteNoResultProb);
+  buf.push_back(nn->whiteScoreMean / 50.0f);
+  buf.push_back(nn->shorttermScoreError / 10.0f);
+  buf.push_back(policyPrior);
+  buf.push_back((float)rank / 361.0f);
+  buf.push_back(evalPla == P_WHITE ? 1.0f : 0.0f);
+  buf.push_back(0.0f);  // [8] winDelta   — deferred
+  buf.push_back(0.0f);  // [9] scoreDelta — deferred
+
+  if(nn->pick != nullptr)
+    buf.insert(buf.end(), nn->pick, nn->pick + trunkCh);
+  else
+    buf.insert(buf.end(), trunkCh, 0.0f);
+
+  if(nn->trunk != nullptr) {
+    int spatial = nnXLen * nnYLen;
+    for(int ch = 0; ch < trunkCh; ch++) {
+      float sum = 0.0f;
+      const float* p = nn->trunk + ch * spatial;
+      for(int i = 0; i < spatial; i++) sum += p[i];
+      buf.push_back(sum / (float)spatial);
+    }
+  } else {
+    buf.insert(buf.end(), trunkCh, 0.0f);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  batch_analysis — Main entry
+// ═════════════════════════════════════════════════════════════════════
 
 int batch_analysis(const vector<string>& args) {
-  // Parse arguments
-  string modelFile, configFile;
-  string listFile, sgfDir;
-  string outputDir = ".";
-  int visits = 0;          // 0 = use config default
-  int minMoves = 10;       // skip games with fewer moves (go-analyzer: 50)
-  int maxGames = 0;        // 0 = all
-  bool headOnly = false;   // only output 12-dim head features
-  bool trunkOnly = false;  // only output 256-dim trunk features
-  bool noCompress = false; // default: zlib compress output
+  string modelFile, configFile, humanModelFile;
+  string listFile, sgfDir, outputDir = ".";
+  int visits = 0, minMoves = 10, maxGames = 0;
+  bool noCompress = false;
 
   for(size_t i = 1; i < args.size(); i++) {
-    if(args[i] == "-config" && i+1 < args.size()) { configFile = args[++i]; }
-    else if(args[i] == "-model" && i+1 < args.size()) { modelFile = args[++i]; }
-    else if(args[i] == "-list" && i+1 < args.size()) { listFile = args[++i]; }
-    else if(args[i] == "-sgf-dir" && i+1 < args.size()) { sgfDir = args[++i]; }
-    else if(args[i] == "-output-dir" && i+1 < args.size()) { outputDir = args[++i]; }
-    else if(args[i] == "-visits" && i+1 < args.size()) { visits = stoi(args[++i]); }
-    else if(args[i] == "-min-moves" && i+1 < args.size()) { minMoves = stoi(args[++i]); }
-    else if(args[i] == "-max-games" && i+1 < args.size()) { maxGames = stoi(args[++i]); }
-    else if(args[i] == "-head-only") { headOnly = true; }
-    else if(args[i] == "-trunk-only") { trunkOnly = true; }
-    else if(args[i] == "-no-compress") { noCompress = true; }
-    else { cerr << "Unknown: " << args[i] << endl; return 1; }
+    if     (args[i] == "-config"      && i+1 < args.size()) configFile     = args[++i];
+    else if(args[i] == "-model"       && i+1 < args.size()) modelFile      = args[++i];
+    else if(args[i] == "-human-model" && i+1 < args.size()) humanModelFile = args[++i];
+    else if(args[i] == "-list"        && i+1 < args.size()) listFile       = args[++i];
+    else if(args[i] == "-sgf-dir"     && i+1 < args.size()) sgfDir         = args[++i];
+    else if(args[i] == "-output-dir"  && i+1 < args.size()) outputDir      = args[++i];
+    else if(args[i] == "-visits"      && i+1 < args.size()) visits         = stoi(args[++i]);
+    else if(args[i] == "-min-moves"   && i+1 < args.size()) minMoves       = stoi(args[++i]);
+    else if(args[i] == "-max-games"   && i+1 < args.size()) maxGames       = stoi(args[++i]);
+    else if(args[i] == "-no-compress") noCompress = true;
+    else { cerr << "Unknown argument: " << args[i] << endl; return 1; }
   }
 
   if(modelFile.empty()) {
-    cerr << "Usage: katago batch-analysis -model model.bin.gz [-list games.csv | -sgf-dir dir/] -output-dir out/" << endl;
-    cerr << "  [-visits N] [-batch-size N] [-max-games N]" << endl;
+    cerr << "Usage: katago batch_analysis -model <model.bin.gz> [-config <cfg>]" << endl;
+    cerr << "  [-list <games.csv> | -sgf-dir <dir/>] [-output-dir <out/>]" << endl;
+    cerr << "  [-visits N] [-min-moves N] [-max-games N] [-no-compress]" << endl;
+    cerr << "  [-human-model <human.bin.gz>]" << endl;
     return 1;
   }
 
-  ensureDir(outputDir);
-
-  // Collect SGF paths
   vector<ListEntry> entries;
   if(!listFile.empty())
     entries = parseList(listFile);
-  else if(!sgfDir.empty()) {
-    // Simple directory listing
-    // TODO: use std::filesystem for C++17 recursive scan
+  if(entries.empty() && !sgfDir.empty()) {
+    vector<string> sgfFiles;
+    FileUtils::collectFiles(sgfDir,
+      [](const string& n){ return n.size() >= 4 && n.substr(n.size()-4) == ".sgf"; },
+      sgfFiles);
+    for(const auto& f : sgfFiles) { ListEntry e; e.sgfPath = f; entries.push_back(e); }
   }
+  if(entries.empty()) { cerr << "No games found (provide -list or -sgf-dir)" << endl; return 1; }
+  if(maxGames > 0 && (int)entries.size() > maxGames) entries.resize(maxGames);
 
-  if(entries.empty()) {
-    cerr << "No games found" << endl;
-    return 1;
-  }
-  if(maxGames > 0 && (int)entries.size() > maxGames)
-    entries.resize(maxGames);
+  ensureDir(outputDir);
 
-  cout << "batch-analysis: " << entries.size() << " games"
-       << ", visits=" << visits
-       << ", visits=" << visits
-       << ", output=" << outputDir << endl;
-
-  // ── NN setup ──
   Logger logger;
   Rand seedRand;
   ConfigParser cfg = configFile.empty() ? ConfigParser() : ConfigParser(configFile);
   Setup::initializeSession(cfg);
-  Board::initHash();  // init Zobrist tables
+  Board::initHash();
+
   int nnXLen = 19, nnYLen = 19;
-  int defaultMaxBatch = 64;  // nnMaxBatchSize in config overrides this
   auto nnEval = Setup::initializeNNEvaluator(
     modelFile, modelFile, "", cfg, logger, seedRand, 64,
-    nnXLen, nnYLen, defaultMaxBatch, true, false, Setup::SETUP_FOR_ANALYSIS
+    nnXLen, nnYLen, 64, true, false, Setup::SETUP_FOR_ANALYSIS
   );
-  if(!nnEval) { cerr << "Failed to load model" << endl; return 1; }
+  if(!nnEval) { cerr << "Failed to load model: " << modelFile << endl; return 1; }
   nnXLen = nnEval->getNNXLen();
   nnYLen = nnEval->getNNYLen();
+  const int trunkCh = nnEval->getModelTrunkNumChannels();
+  const int moveDim = SCALAR_DIM + 2 * trunkCh;
 
-  const string runId = timestamp();
+  (void)visits;
+  (void)humanModelFile;
+
+  cout << "batch-analysis: " << entries.size() << " games"
+       << "  trunkCh=" << trunkCh << "  moveDim=" << moveDim
+       << "  headerBytes=" << sizeof(NPZHeader)
+       << "  output=" << outputDir << endl;
+
+  bool metaHeaderWritten = false;
   int success = 0, failed = 0, skipped = 0;
 
-  // ── Process each game ──
   for(size_t gi = 0; gi < entries.size(); gi++) {
     const auto& entry = entries[gi];
     const string base = "game_" + Global::uint64ToHexString(gi);
 
-    // Load SGF with error tolerance
-    auto sgf = CompactSgf::loadFile(entry.sgfPath);
-    if(!sgf) { failed++; continue; }
+    try {
+      auto sgf = CompactSgf::loadFile(entry.sgfPath);
+      if(!sgf) { failed++; continue; }
 
-    // Extract main line only (CompactSgf already skips branches)
-    auto& moves = sgf->moves;
-    if((int)moves.size() < minMoves) { skipped++; continue; }
+      auto& moves = sgf->moves;
+      if((int)moves.size() < minMoves) { skipped++; continue; }
 
-    // Parse game metadata
-    GameMeta meta;
-    meta.blackName = entry.playerBlack;
-    meta.whiteName = entry.playerWhite;
-    meta.blackElo = entry.blackElo;
-    meta.whiteElo = entry.whiteElo;
-    meta.numMoves = (int)moves.size();
+      Rules rules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
+      Board board;
+      BoardHistory history;
+      Player initialPla;
+      sgf->setupInitialBoardAndHist(rules, board, initialPla, history);
 
-    // Play through the game
-    Rules rules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
-    Board board;
-    BoardHistory history;
-    Player initialPla;
-    sgf->setupInitialBoardAndHist(rules, board, initialPla, history);
+      vector<float> data_B, data_W;
+      data_B.reserve(80 * moveDim);
+      data_W.reserve(80 * moveDim);
+      int nBlack = 0, nWhite = 0;
+      PlayerAcc accB, accW;
 
-    vector<MoveRecord> blackRecords, whiteRecords;
+      // Deferred delta: at turn t+1 we know winProb[t+1] and fill scalars[8,9] of turn t
+      float          prevWinProb    = 0.5f;
+      float          prevScoreMean  = 0.0f;
+      bool           hasPrevEval    = false;
+      vector<float>* prevBuf        = nullptr;
+      int            prevRecordIdx  = -1;
+      Player         prevPla        = P_BLACK;
 
-    for(size_t turn = 0; turn < moves.size(); turn++) {
-      const Move& move = moves[turn];
-      if(move.loc == Board::NULL_LOC) continue;  // skip passes
-
-      Player evalPla = move.pla;
-      int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
-
-      // Evaluate position (before move)
-      NNResultBuf buf;
-      buf.result = std::make_shared<NNOutput>();
-      MiscNNInputParams params;
-      params.symmetry = 0;
-      params.policyOptimism = 0;
-
-      nnEval->evaluate(board, history, evalPla, params, buf, false, false);
-      NNOutput* output = buf.result.get();
-      if(!output) continue;
-
-      MoveRecord rec;
-      memset(&rec, 0, sizeof(rec));
-      extractHead(output, rowPos, rec.head, evalPla);
-      rec.head[11] = (evalPla == P_BLACK ? 0.0f : 1.0f);
-
-      // Trunk features (spatial average pool)
-      if(output->trunk) {
-        int spatial = nnXLen * nnYLen;
-        int ch = TRUNK_DIM;
-        for(int c = 0; c < ch; c++) {
-          double sum = 0;
-          for(int xy = 0; xy < spatial; xy++)
-            sum += output->trunk[c * spatial + xy];
-          rec.trunk[c] = (float)(sum / spatial);
+      for(size_t turn = 0; turn < moves.size(); turn++) {
+        const Move& move = moves[turn];
+        if(move.loc == Board::NULL_LOC) {
+          history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+          continue;
         }
-      }
 
-      // Pick features (at move position)
-      if(output->pick && rowPos >= 0) {
-        for(int c = 0; c < PICK_DIM; c++)
-          rec.pick[c] = output->pick[c];
-      }
+        Player evalPla = move.pla;
+        int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
 
-      // Assign to correct player
-      if(evalPla == P_BLACK) blackRecords.push_back(rec);
-      else whiteRecords.push_back(rec);
+        NNResultBuf nnbuf;
+        nnbuf.result = std::make_shared<NNOutput>();
+        nnbuf.result->includeTrunk = true;
+        nnbuf.result->includePick  = true;
+        MiscNNInputParams params;
+        params.symmetry = 0;
+        params.policyOptimism = 0.0;
+        nnEval->evaluate(board, history, evalPla, params, nnbuf, true, false);
+        NNOutput* output = nnbuf.result.get();
 
-      // Make the move
-      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-    }
-
-    // Write NPZ per player
-    {
-      auto& records = blackRecords;
-      if((int)records.size() >= 5) {
-        string outpath = outputDir + "/" + base + "_B.npz";
-        ofstream out(outpath, ios::binary);
-        if(out) {
-          int n = (int)records.size(), hd = 12, tk = 256, flags = noCompress ? 0 : 1;
-          out.write("KABN", 4);
-          out.write((const char*)&n, 4); out.write((const char*)&hd, 4);
-          out.write((const char*)&tk, 4); out.write((const char*)&flags, 4);
-          size_t raw = records.size() * sizeof(MoveRecord);
-          if(noCompress) {
-            out.write((const char*)records.data(), raw);
-          } else { uLongf cl = compressBound(raw); vector<char> cb(cl);
-            if(compress((Bytef*)cb.data(), &cl, (const Bytef*)records.data(), raw) == Z_OK)
-              { out.write((const char*)&cl, 4); out.write(cb.data(), cl); }
-            else { int z=0; out.write((const char*)&z,4); out.write((const char*)records.data(), raw); }
+        if(output) {
+          // ── 1. Fill deferred delta into previous record ──────────────────
+          if(hasPrevEval && prevBuf && prevRecordIdx >= 0) {
+            float wD = output->whiteWinProb   - prevWinProb;
+            float sD = output->whiteScoreMean - prevScoreMean;
+            int base_ = prevRecordIdx * moveDim;
+            (*prevBuf)[base_ + 8] = wD;
+            (*prevBuf)[base_ + 9] = sD / 50.0f;
+            // Player-perspective delta (flip sign for Black)
+            float pWD = (prevPla == P_BLACK) ? -wD :  wD;
+            float pSD = (prevPla == P_BLACK) ? -sD :  sD;
+            ((prevPla == P_BLACK) ? accB : accW).addDelta(pWD, pSD);
           }
+
+          // ── 2. Compute move-level stats (once, shared by acc and record) ─
+          float policyPrior = (rowPos >= 0 && rowPos < NNPos::MAX_NN_POLICY_SIZE)
+                              ? output->policyProbs[rowPos] : 0.0f;
+          int rank = 0;
+          for(int i = 0; i < NNPos::MAX_NN_POLICY_SIZE; i++)
+            if(output->policyProbs[i] > policyPrior) rank++;
+
+          float playerWinRate   = (evalPla == P_BLACK)
+                                  ? 1.0f - output->whiteWinProb
+                                  : output->whiteWinProb;
+          float playerScoreLead = (evalPla == P_BLACK)
+                                  ? -output->whiteScoreMean
+                                  :  output->whiteScoreMean;
+
+          // ── 3. Update accumulator ─────────────────────────────────────────
+          ((evalPla == P_BLACK) ? accB : accW).addMove(
+            rank, policyPrior, playerWinRate, playerScoreLead,
+            output->shorttermScoreError
+          );
+
+          // ── 4. Append record (delta slots pre-zeroed, filled above next turn)
+          int curIdx = (evalPla == P_BLACK) ? nBlack : nWhite;
+          auto& dataBuf = (evalPla == P_BLACK) ? data_B : data_W;
+          appendMoveRecord(dataBuf, output, evalPla, policyPrior, rank,
+                           trunkCh, nnXLen, nnYLen);
+
+          // ── 5. Advance deferred-delta tracking ───────────────────────────
+          prevWinProb   = output->whiteWinProb;
+          prevScoreMean = output->whiteScoreMean;
+          hasPrevEval   = true;
+          prevBuf       = &dataBuf;
+          prevRecordIdx = curIdx;
+          prevPla       = evalPla;
+
+          if(evalPla == P_BLACK) nBlack++; else nWhite++;
+        }
+
+        history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+      }
+
+      // ── Write per-player NPZ files ───────────────────────────────────────
+      if(nBlack >= 5)
+        writePlayerFile(outputDir + "/" + base + "_B.npz",
+                        data_B, nBlack, trunkCh, nnXLen, nnYLen, !noCompress,
+                        accB.toSummary());
+      if(nWhite >= 5)
+        writePlayerFile(outputDir + "/" + base + "_W.npz",
+                        data_W, nWhite, trunkCh, nnXLen, nnYLen, !noCompress,
+                        accW.toSummary());
+
+      // ── Append to meta CSV ───────────────────────────────────────────────
+      if(!metaHeaderWritten) {
+        ofstream hdr(outputDir + "/_meta.csv");
+        if(hdr)
+          hdr << "file,black,white,black_elo,white_elo,total_moves,black_moves,white_moves,set,"
+                 "B_acc1,B_acc3,B_logPrior,B_winRate,B_scoreLead,B_complexity,B_scoreVar,B_drop,"
+                 "W_acc1,W_acc3,W_logPrior,W_winRate,W_scoreLead,W_complexity,W_scoreVar,W_drop\n";
+        metaHeaderWritten = true;
+      }
+      {
+        PlayerSummary sb = accB.toSummary(), sw = accW.toSummary();
+        ofstream meta(outputDir + "/_meta.csv", ios::app);
+        if(meta) {
+          meta << base << "," << entry.playerBlack << "," << entry.playerWhite << ","
+               << entry.blackElo << "," << entry.whiteElo << ","
+               << moves.size() << "," << nBlack << "," << nWhite << "," << entry.set << ","
+               << sb.accuracy1 << "," << sb.accuracy3 << "," << sb.meanLogPrior << ","
+               << sb.meanWinRate << "," << sb.meanScoreLead << "," << sb.meanComplexity << ","
+               << sb.scoreVariance << "," << sb.approxScoreDrop << ","
+               << sw.accuracy1 << "," << sw.accuracy3 << "," << sw.meanLogPrior << ","
+               << sw.meanWinRate << "," << sw.meanScoreLead << "," << sw.meanComplexity << ","
+               << sw.scoreVariance << "," << sw.approxScoreDrop << "\n";
         }
       }
-    }
-    {
-      auto& records = whiteRecords;
-      if((int)records.size() >= 5) {
-        string outpath = outputDir + "/" + base + "_W.npz";
-        ofstream out(outpath, ios::binary);
-        if(out) {
-          int n = (int)records.size(), hd = 12, tk = 256, flags = noCompress ? 0 : 1;
-          out.write("KABN", 4);
-          out.write((const char*)&n, 4); out.write((const char*)&hd, 4);
-          out.write((const char*)&tk, 4); out.write((const char*)&flags, 4);
-          size_t raw = records.size() * sizeof(MoveRecord);
-          if(noCompress) {
-            out.write((const char*)records.data(), raw);
-          } else { uLongf cl = compressBound(raw); vector<char> cb(cl);
-            if(compress((Bytef*)cb.data(), &cl, (const Bytef*)records.data(), raw) == Z_OK)
-              { out.write((const char*)&cl, 4); out.write(cb.data(), cl); }
-            else { int z=0; out.write((const char*)&z,4); out.write((const char*)records.data(), raw); }
-          }
-        }
-      }
+
+      success++;
+    } catch(const exception& e) {
+      cerr << "Error on game " << gi << " (" << entry.sgfPath << "): " << e.what() << endl;
+      failed++;
     }
 
-    // Write metadata CSV (one line per game)
-    if(gi == 0) {
-      ofstream metaOut(outputDir + "/_meta.csv");
-      if(metaOut) {
-        metaOut << "file,black,white,black_elo,white_elo,moves,analyzed" << endl;
-        metaOut.close();
-      }
-    }
-    ofstream metaOutApp(outputDir + "/_meta.csv", ios::app);
-    if(metaOutApp) {
-      metaOutApp << base << ","
-                 << meta.blackName << "," << meta.whiteName << ","
-                 << meta.blackElo << "," << meta.whiteElo << ","
-                 << meta.numMoves << ","
-                 << (blackRecords.size() + whiteRecords.size()) << endl;
-    }
-
-    success++;
-
-    // Progress report (go-analyzer style: every 10 or at end)
     if((gi+1) % 10 == 0 || gi == entries.size()-1) {
-      double elapsed = 0; // could track time
-      cout << "  [" << (gi+1) << "/" << entries.size() << "] "
-           << "ok=" << success << " skip=" << skipped << " fail=" << failed
-           << " (last: " << meta.blackName << " vs " << meta.whiteName << ")" << endl;
+      cout << "  [" << (gi+1) << "/" << entries.size() << "]"
+           << "  ok=" << success << " skip=" << skipped << " fail=" << failed << endl;
     }
   }
 
   cout << "\n=== batch-analysis complete ===" << endl;
-  cout << "  Games: " << entries.size() << " total, "
-       << success << " ok, " << skipped << " skipped (<10 moves), "
-       << failed << " failed" << endl;
-  cout << "  Output: " << outputDir << "/" << endl;
+  cout << "  total=" << entries.size()
+       << "  ok=" << success << "  skipped(<" << minMoves << "mv)=" << skipped
+       << "  failed=" << failed << endl;
+  cout << "  format: KAB2  scalarDim=" << SCALAR_DIM
+       << "  trunkCh=" << trunkCh << "  moveDim=" << moveDim << endl;
+  cout << "  output: " << outputDir << "/" << endl;
   return 0;
 }
 

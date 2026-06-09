@@ -290,6 +290,9 @@ int NNEvaluator::getModelVersion() const {
 double NNEvaluator::getTrunkSpatialConvDepth() const {
   return NeuralNet::getModelDesc(loadedModel).getTrunkSpatialConvDepth();
 }
+int NNEvaluator::getModelTrunkNumChannels() const {
+  return NeuralNet::getModelDesc(loadedModel).trunk.trunkNumChannels;
+}
 
 enabled_t NNEvaluator::getUsingFP16Mode() const {
   return usingFP16Mode;

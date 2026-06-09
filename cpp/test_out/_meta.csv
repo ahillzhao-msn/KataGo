@@ -1,0 +1,3 @@
+file,black,white,black_elo,white_elo,total_moves,black_moves,white_moves,set,B_acc1,B_acc3,B_logPrior,B_winRate,B_scoreLead,B_complexity,B_scoreVar,B_drop,W_acc1,W_acc3,W_logPrior,W_winRate,W_scoreLead,W_complexity,W_scoreVar,W_drop
+game_0000000000000000,test,test,1500,1500,102,51,51,T,0.823529,0.980392,-0.80867,0.426469,-2.16665,1.07133,13.5774,0.00909463,0.823529,0.921569,-0.857416,0.569421,2.15475,1.07158,16.1059,0.00594923
+game_0000000000000001,test,test,1500,1500,122,61,61,T,0.836066,0.967213,-0.902302,0.277423,-4.10774,1.14172,15.1491,0.0124787,0.786885,0.983607,-0.768744,0.720995,3.78078,1.24172,11.9669,0.0104173

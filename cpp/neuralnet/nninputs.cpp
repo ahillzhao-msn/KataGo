@@ -482,6 +482,14 @@ NNOutput::~NNOutput() {
     delete[] noisedPolicyProbs;
     noisedPolicyProbs = NULL;
   }
+  if(trunk != NULL) {
+    delete[] trunk;
+    trunk = NULL;
+  }
+  if(pick != NULL) {
+    delete[] pick;
+    pick = NULL;
+  }
 }
 
 

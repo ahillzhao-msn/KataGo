@@ -4276,6 +4276,16 @@ void NeuralNet::getOutput(
     output->whiteLossProb = inputBuffers->valueResults[row * numValueChannels + 1];
     output->whiteNoResultProb = inputBuffers->valueResults[row * numValueChannels + 2];
 
+    // Copy trunk features
+    // (always reads if trunkResults available; minimal perf impact)
+    if(inputBuffers->trunkResults != NULL) {
+      int trunkCh = gpuHandle->model->trunk->trunkNumChannels;
+      int trunkSpatial = nnXLen * nnYLen;
+      const float* trunkSrc = inputBuffers->trunkResults + row * trunkCh * trunkSpatial;
+      output->trunk = new float[trunkCh * trunkSpatial];
+      SymmetryHelpers::copyOutputsWithSymmetry(trunkSrc, output->trunk, trunkCh, nnYLen, nnXLen, inputBufs[row]->symmetry);
+    }
+
     //As above, these are NOT actually from white's perspective, but rather the player to move.
     //As usual the client does the postprocessing.
     if(output->whiteOwnerMap != NULL) {
