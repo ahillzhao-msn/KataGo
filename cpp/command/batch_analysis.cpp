@@ -10,6 +10,10 @@
 //   [5] policyPrior  [6] policyRank/361  [7] isWhite
 //   [8] winDelta    (whiteWinProb[t+1]  - whiteWinProb[t],   deferred fill)
 //   [9] scoreDelta/50 (whiteScoreMean[t+1] - whiteScoreMean[t], deferred fill)
+//
+// HumanSL (optional, -human-model):
+//   Second pass over each game; tests 3 candidate rank profiles per player
+//   (selected from meanLogPrior estimate); stores best-match rank in PlayerSummary.
 
 #include "batch_analysis.h"
 
@@ -29,7 +33,7 @@
 #include "../dataio/sgf.h"
 #include "../main.h"
 #include "../neuralnet/modelversion.h"
-#include "../neuralnet/nneval.h"
+#include "../neuralnet/nneval.h"   // also pulls in sgfmetadata.h
 #include "../program/play.h"
 #include "../program/setup.h"
 #include <zlib.h>
@@ -38,22 +42,50 @@ using namespace std;
 
 namespace MainCmds {
 
-static const int SCALAR_DIM = 10;
+static const int SCALAR_DIM       = 10;
+static const int HUMAN_CANDIDATES = 3;   // rank profiles tested per player per game
+
+// 29 profiles ordered weakest → strongest (idx 0=20k … idx 28=9d)
+static const int NUM_RANK_PROFILES = 29;
+static const char* RANK_PROFILES[NUM_RANK_PROFILES] = {
+  "rank_20k","rank_19k","rank_18k","rank_17k","rank_16k","rank_15k",
+  "rank_14k","rank_13k","rank_12k","rank_11k","rank_10k","rank_9k",
+  "rank_8k", "rank_7k", "rank_6k", "rank_5k", "rank_4k", "rank_3k",
+  "rank_2k", "rank_1k", "rank_1d", "rank_2d", "rank_3d", "rank_4d",
+  "rank_5d", "rank_6d", "rank_7d", "rank_8d", "rank_9d"
+};
+
+static string rankIdxToStr(float idx) {
+  int i = (int)(idx + 0.5f);
+  if(i < 0 || i >= NUM_RANK_PROFILES) return "?";
+  return RANK_PROFILES[i];
+}
+
+// Map meanLogPrior → 3 neighbouring candidate rank indices.
+// Empirical range: -5.9 (20k, idx=0) to -0.5 (9d, idx=28).
+// More negative logPrior = weaker player = lower idx.
+static vector<int> rankCandidates(float logPrior) {
+  float t = std::max(0.0f, std::min(1.0f, (logPrior + 5.9f) / 5.4f));
+  int mid = std::min(27, std::max(1, (int)(t * 28.0f + 0.5f)));
+  return {mid - 1, mid, mid + 1};
+}
 
 // ─── Per-player aggregate statistics (embedded in NPZHeader) ──────────
 
 struct PlayerSummary {
   float accuracy1;        // fraction top-1 match (rank == 0)
   float accuracy3;        // fraction top-3 match (rank <= 2)
-  float meanLogPrior;     // mean log(policyPrior) — log-likelihood strength signal
-  float meanWinRate;      // mean player win probability across their moves
+  float meanLogPrior;     // mean log(policyPrior) — core strength signal
+  float meanWinRate;      // mean player win probability
   float meanScoreLead;    // mean player score lead (points, player's perspective)
   float meanComplexity;   // mean shorttermScoreError
   float scoreVariance;    // variance of player score lead (Welford online)
   float approxScoreDrop;  // mean max(0, -playerWinDelta) — mistake proxy
   float meanWinDelta;     // mean signed win delta (player's perspective)
-  float meanScoreDelta;   // mean signed score delta (player's perspective, points)
-  float reserved[6];      // pad to 16 floats = 64 bytes
+  float meanScoreDelta;   // mean signed score delta (player's perspective)
+  float humanRankIdx;     // best HumanSL rank index (0=20k…28=9d), -1 if not used
+  float humanLogPrior;    // meanLogPrior under best HumanSL profile
+  float reserved[4];      // pad to 16 floats = 64 bytes
 };
 
 #pragma pack(push, 1)
@@ -61,7 +93,7 @@ struct NPZHeader {
   char magic[4];         // "KAB2"
   int32_t numMoves;
   int32_t scalarDim;     // SCALAR_DIM = 10
-  int32_t trunkDim;      // avg-pooled trunk channels
+  int32_t trunkDim;      // avg-pooled trunk channels (dynamic)
   int32_t pickDim;       // pick channels (= trunkDim)
   int32_t nnXLen;
   int32_t nnYLen;
@@ -79,7 +111,7 @@ struct PlayerAcc {
   float sumLogPrior = 0;
   float sumWinRate = 0, sumScoreLead = 0, sumComplexity = 0;
   float sumWinDelta = 0, sumScoreDelta = 0, sumDrop = 0;
-  float wfMean = 0, wfM2 = 0;  // Welford online variance for score lead
+  float wfMean = 0, wfM2 = 0;
 
   void addMove(int rank, float policyPrior, float playerWinRate,
                float playerScoreLead, float complexity) {
@@ -103,6 +135,8 @@ struct PlayerAcc {
 
   PlayerSummary toSummary() const {
     PlayerSummary s = {};
+    s.humanRankIdx  = -1.0f;  // not yet computed
+    s.humanLogPrior = 0.0f;
     if(n == 0) return s;
     s.accuracy1       = sumTop1 / n;
     s.accuracy3       = sumTop3 / n;
@@ -137,7 +171,7 @@ static vector<ListEntry> parseList(const string& path) {
   ifstream in(path);
   if(!in) { cerr << "Cannot open list: " << path << endl; return entries; }
   string line;
-  getline(in, line);  // skip header
+  getline(in, line);
   while(getline(in, line)) {
     if(line.empty()) continue;
     stringstream ss(line);
@@ -199,12 +233,15 @@ static void writePlayerFile(
   }
 }
 
-// Append one move's feature block.  Scalars[8,9] = 0 (deferred delta fill).
-// policyPrior and rank are pre-computed by the caller to avoid duplication.
+// Append one move's feature block.
+// Pick is extracted directly from trunk (NCHW: trunk[ch*spatial + rowPos])
+// rather than relying on the backend's includePick path, which can return
+// zeros on the first evaluation due to buffer initialisation ordering.
+// Scalars [8,9] = 0 as deferred-fill placeholders for winDelta / scoreDelta.
 static void appendMoveRecord(
   vector<float>& buf,
   const NNOutput* nn, Player evalPla,
-  float policyPrior, int rank,
+  float policyPrior, int rank, int rowPos,
   int trunkCh, int nnXLen, int nnYLen
 ) {
   buf.push_back(nn->whiteWinProb);
@@ -218,13 +255,18 @@ static void appendMoveRecord(
   buf.push_back(0.0f);  // [8] winDelta   — deferred
   buf.push_back(0.0f);  // [9] scoreDelta — deferred
 
-  if(nn->pick != nullptr)
-    buf.insert(buf.end(), nn->pick, nn->pick + trunkCh);
-  else
-    buf.insert(buf.end(), trunkCh, 0.0f);
+  int spatial = nnXLen * nnYLen;
 
+  // Pick: trunk slice at move location (extracted from trunk, NCHW layout)
+  if(nn->trunk != nullptr && rowPos >= 0 && rowPos < spatial) {
+    for(int ch = 0; ch < trunkCh; ch++)
+      buf.push_back(nn->trunk[ch * spatial + rowPos]);
+  } else {
+    buf.insert(buf.end(), trunkCh, 0.0f);
+  }
+
+  // AvgTrunk: spatial mean of full trunk
   if(nn->trunk != nullptr) {
-    int spatial = nnXLen * nnYLen;
     for(int ch = 0; ch < trunkCh; ch++) {
       float sum = 0.0f;
       const float* p = nn->trunk + ch * spatial;
@@ -234,6 +276,87 @@ static void appendMoveRecord(
   } else {
     buf.insert(buf.end(), trunkCh, 0.0f);
   }
+}
+
+// ─── HumanSL second pass ─────────────────────────────────────────────
+//
+// Re-replays all moves in the game and queries humanEval with 3 candidate
+// rank profiles for each player.  Updates sb.humanRankIdx / humanLogPrior.
+
+static void runHumanSLPass(
+  const CompactSgf* sgf, const Rules& rules,
+  NNEvaluator* humanEval,
+  const vector<int>& candB, const vector<int>& candW,
+  int nnXLen, int nnYLen,
+  PlayerSummary& sb, PlayerSummary& sw
+) {
+  Board board;
+  BoardHistory history;
+  Player initialPla;
+  sgf->setupInitialBoardAndHist(rules, board, initialPla, history);
+
+  float sumLogB[HUMAN_CANDIDATES] = {}, sumLogW[HUMAN_CANDIDATES] = {};
+  int   cntB  [HUMAN_CANDIDATES] = {}, cntW  [HUMAN_CANDIDATES] = {};
+
+  for(const Move& move : sgf->moves) {
+    if(move.loc == Board::NULL_LOC) {
+      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+      continue;
+    }
+
+    Player evalPla = move.pla;
+    int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
+
+    const vector<int>& cand = (evalPla == P_BLACK) ? candB : candW;
+    float* sumLog = (evalPla == P_BLACK) ? sumLogB : sumLogW;
+    int*   cnt    = (evalPla == P_BLACK) ? cntB    : cntW;
+
+    for(int k = 0; k < HUMAN_CANDIDATES; k++) {
+      SGFMetadata meta = SGFMetadata::getProfile(RANK_PROFILES[cand[k]]);
+
+      NNResultBuf hbuf;
+      hbuf.result = std::make_shared<NNOutput>();
+      hbuf.result->includeTrunk = false;  // policy head only for HumanSL
+      hbuf.result->includePick  = false;
+
+      MiscNNInputParams hparams;
+      hparams.symmetry = 0;
+      hparams.policyOptimism = 0.0;
+
+      humanEval->evaluate(board, history, evalPla, &meta, hparams, hbuf, true, false);
+
+      if(hbuf.result) {
+        float prob = (rowPos >= 0 && rowPos < NNPos::MAX_NN_POLICY_SIZE)
+                     ? hbuf.result->policyProbs[rowPos] : 0.0f;
+        sumLog[k] += std::log(std::max(prob, 1e-10f));
+        cnt[k]++;
+      }
+    }
+
+    history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+  }
+
+  // Pick best candidate for each player
+  auto selectBest = [](const float sl[], const int ct[],
+                       const vector<int>& cand) -> pair<int,float> {
+    int   bestK    = 0;
+    float bestMean = -1e20f;
+    for(int k = 0; k < HUMAN_CANDIDATES; k++) {
+      if(ct[k] > 0) {
+        float m = sl[k] / ct[k];
+        if(m > bestMean) { bestMean = m; bestK = k; }
+      }
+    }
+    return {cand[bestK], bestMean};
+  };
+
+  auto [idxB, meanB] = selectBest(sumLogB, cntB, candB);
+  auto [idxW, meanW] = selectBest(sumLogW, cntW, candW);
+
+  sb.humanRankIdx  = (float)idxB;
+  sb.humanLogPrior = meanB;
+  sw.humanRankIdx  = (float)idxW;
+  sw.humanLogPrior = meanW;
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -300,13 +423,27 @@ int batch_analysis(const vector<string>& args) {
   const int trunkCh = nnEval->getModelTrunkNumChannels();
   const int moveDim = SCALAR_DIM + 2 * trunkCh;
 
-  (void)visits;
-  (void)humanModelFile;
+  // Optional HumanSL evaluator
+  NNEvaluator* humanEval = nullptr;
+  if(!humanModelFile.empty()) {
+    humanEval = Setup::initializeNNEvaluator(
+      humanModelFile, humanModelFile, "", cfg, logger, seedRand, 64,
+      nnXLen, nnYLen, 64, true, false, Setup::SETUP_FOR_ANALYSIS
+    );
+    if(!humanEval)
+      cerr << "Warning: failed to load human model: " << humanModelFile
+           << " — HumanSL pass skipped." << endl;
+    else if(!humanEval->requiresSGFMetadata())
+      cerr << "Warning: -human-model does not appear to be a HumanSL model." << endl;
+  }
+
+  (void)visits;  // reserved for future MCTS depth control
 
   cout << "batch-analysis: " << entries.size() << " games"
        << "  trunkCh=" << trunkCh << "  moveDim=" << moveDim
-       << "  headerBytes=" << sizeof(NPZHeader)
-       << "  output=" << outputDir << endl;
+       << "  headerBytes=" << sizeof(NPZHeader);
+  if(humanEval) cout << "  [+HumanSL x" << HUMAN_CANDIDATES << "]";
+  cout << "  output=" << outputDir << endl;
 
   bool metaHeaderWritten = false;
   int success = 0, failed = 0, skipped = 0;
@@ -334,7 +471,7 @@ int batch_analysis(const vector<string>& args) {
       int nBlack = 0, nWhite = 0;
       PlayerAcc accB, accW;
 
-      // Deferred delta: at turn t+1 we know winProb[t+1] and fill scalars[8,9] of turn t
+      // Deferred delta tracking
       float          prevWinProb    = 0.5f;
       float          prevScoreMean  = 0.0f;
       bool           hasPrevEval    = false;
@@ -355,7 +492,8 @@ int batch_analysis(const vector<string>& args) {
         NNResultBuf nnbuf;
         nnbuf.result = std::make_shared<NNOutput>();
         nnbuf.result->includeTrunk = true;
-        nnbuf.result->includePick  = true;
+        nnbuf.result->includePick  = false;  // we extract pick from trunk directly
+
         MiscNNInputParams params;
         params.symmetry = 0;
         params.policyOptimism = 0.0;
@@ -370,13 +508,12 @@ int batch_analysis(const vector<string>& args) {
             int base_ = prevRecordIdx * moveDim;
             (*prevBuf)[base_ + 8] = wD;
             (*prevBuf)[base_ + 9] = sD / 50.0f;
-            // Player-perspective delta (flip sign for Black)
             float pWD = (prevPla == P_BLACK) ? -wD :  wD;
             float pSD = (prevPla == P_BLACK) ? -sD :  sD;
             ((prevPla == P_BLACK) ? accB : accW).addDelta(pWD, pSD);
           }
 
-          // ── 2. Compute move-level stats (once, shared by acc and record) ─
+          // ── 2. Move-level stats (computed once, shared by acc + record) ──
           float policyPrior = (rowPos >= 0 && rowPos < NNPos::MAX_NN_POLICY_SIZE)
                               ? output->policyProbs[rowPos] : 0.0f;
           int rank = 0;
@@ -396,10 +533,10 @@ int batch_analysis(const vector<string>& args) {
             output->shorttermScoreError
           );
 
-          // ── 4. Append record (delta slots pre-zeroed, filled above next turn)
+          // ── 4. Append record (delta slots pre-zeroed, filled above) ──────
           int curIdx = (evalPla == P_BLACK) ? nBlack : nWhite;
           auto& dataBuf = (evalPla == P_BLACK) ? data_B : data_W;
-          appendMoveRecord(dataBuf, output, evalPla, policyPrior, rank,
+          appendMoveRecord(dataBuf, output, evalPla, policyPrior, rank, rowPos,
                            trunkCh, nnXLen, nnYLen);
 
           // ── 5. Advance deferred-delta tracking ───────────────────────────
@@ -416,39 +553,56 @@ int batch_analysis(const vector<string>& args) {
         history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
       }
 
-      // ── Write per-player NPZ files ───────────────────────────────────────
+      // ── PlayerSummary from first pass ────────────────────────────────────
+      PlayerSummary sb = accB.toSummary();
+      PlayerSummary sw = accW.toSummary();
+
+      // ── HumanSL second pass (optional) ───────────────────────────────────
+      if(humanEval && nBlack >= 5 && nWhite >= 5) {
+        try {
+          vector<int> candB = rankCandidates(sb.meanLogPrior);
+          vector<int> candW = rankCandidates(sw.meanLogPrior);
+          runHumanSLPass(sgf.get(), rules, humanEval,
+                         candB, candW, nnXLen, nnYLen, sb, sw);
+        } catch(const exception& e) {
+          cerr << "HumanSL pass failed for game " << gi << ": " << e.what() << endl;
+          // sb/sw.humanRankIdx stays -1
+        }
+      }
+
+      // ── Write per-player NPZ files ────────────────────────────────────────
       if(nBlack >= 5)
         writePlayerFile(outputDir + "/" + base + "_B.npz",
-                        data_B, nBlack, trunkCh, nnXLen, nnYLen, !noCompress,
-                        accB.toSummary());
+                        data_B, nBlack, trunkCh, nnXLen, nnYLen, !noCompress, sb);
       if(nWhite >= 5)
         writePlayerFile(outputDir + "/" + base + "_W.npz",
-                        data_W, nWhite, trunkCh, nnXLen, nnYLen, !noCompress,
-                        accW.toSummary());
+                        data_W, nWhite, trunkCh, nnXLen, nnYLen, !noCompress, sw);
 
-      // ── Append to meta CSV ───────────────────────────────────────────────
+      // ── Meta CSV ──────────────────────────────────────────────────────────
       if(!metaHeaderWritten) {
         ofstream hdr(outputDir + "/_meta.csv");
         if(hdr)
           hdr << "file,black,white,black_elo,white_elo,total_moves,black_moves,white_moves,set,"
                  "B_acc1,B_acc3,B_logPrior,B_winRate,B_scoreLead,B_complexity,B_scoreVar,B_drop,"
-                 "W_acc1,W_acc3,W_logPrior,W_winRate,W_scoreLead,W_complexity,W_scoreVar,W_drop\n";
+                 "B_humanRank,B_humanLogPrior,"
+                 "W_acc1,W_acc3,W_logPrior,W_winRate,W_scoreLead,W_complexity,W_scoreVar,W_drop,"
+                 "W_humanRank,W_humanLogPrior\n";
         metaHeaderWritten = true;
       }
       {
-        PlayerSummary sb = accB.toSummary(), sw = accW.toSummary();
         ofstream meta(outputDir + "/_meta.csv", ios::app);
-        if(meta) {
+        if(meta)
           meta << base << "," << entry.playerBlack << "," << entry.playerWhite << ","
                << entry.blackElo << "," << entry.whiteElo << ","
                << moves.size() << "," << nBlack << "," << nWhite << "," << entry.set << ","
                << sb.accuracy1 << "," << sb.accuracy3 << "," << sb.meanLogPrior << ","
                << sb.meanWinRate << "," << sb.meanScoreLead << "," << sb.meanComplexity << ","
                << sb.scoreVariance << "," << sb.approxScoreDrop << ","
+               << rankIdxToStr(sb.humanRankIdx) << "," << sb.humanLogPrior << ","
                << sw.accuracy1 << "," << sw.accuracy3 << "," << sw.meanLogPrior << ","
                << sw.meanWinRate << "," << sw.meanScoreLead << "," << sw.meanComplexity << ","
-               << sw.scoreVariance << "," << sw.approxScoreDrop << "\n";
-        }
+               << sw.scoreVariance << "," << sw.approxScoreDrop << ","
+               << rankIdxToStr(sw.humanRankIdx) << "," << sw.humanLogPrior << "\n";
       }
 
       success++;
