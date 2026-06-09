@@ -3858,7 +3858,8 @@ struct InputBuffers {
   float* userInputGlobalBuffer; //Host pointer
   float* userInputMetaBuffer; //Host pointer
 
-  float* trunkResults; //Trunk output buffer (host)
+  float*  trunkResults;     //Trunk output buffer (host, FP32)
+  half_t* trunkResultsHalf; //Trunk output buffer (host, FP16 — used when useFP16Storage)
   float* policyPassResults; //Host pointer
   float* policyResults; //Host pointer
   half_t* policyResultsHalf; //Host pointer
@@ -3909,7 +3910,8 @@ struct InputBuffers {
     policyResults = new float[(size_t)maxBatchSize * m.numPolicyChannels * nnXLen * nnYLen];
     policyResultsHalf = new half_t[(size_t)maxBatchSize * m.numPolicyChannels * maxPaddedNNXYLen];
     valueResults = new float[(size_t)maxBatchSize * m.numValueChannels];
-    trunkResults = new float[(size_t)maxBatchSize * m.trunk.trunkNumChannels * nnXLen * nnYLen];
+    trunkResults     = new float [(size_t)maxBatchSize * m.trunk.trunkNumChannels * nnXLen * nnYLen];
+    trunkResultsHalf = new half_t[(size_t)maxBatchSize * m.trunk.trunkNumChannels * nnXLen * nnYLen];
 
     scoreValueResults = new float[(size_t)maxBatchSize * m.numScoreValueChannels];
     ownershipResults = new float[(size_t)maxBatchSize * nnXLen * nnYLen * m.numOwnershipChannels];
@@ -3923,6 +3925,7 @@ struct InputBuffers {
     if(userInputMetaBuffer != NULL)
       delete[] userInputMetaBuffer;
     delete[] trunkResults;
+    delete[] trunkResultsHalf;
     delete[] policyPassResults;
     delete[] policyResults;
     delete[] policyResultsHalf;
@@ -4160,14 +4163,25 @@ void NeuralNet::getOutput(
   );
   CHECK_ERR(err);
 
-  // Read trunk buffer from GPU for strength model
+  // Read trunk buffer from GPU; handle FP16→FP32 conversion when needed
   if(inputBuffers->trunkResults != NULL) {
-    err = clEnqueueReadBuffer(
-      handle->commandQueue, gpuHandle->buffers->trunk, blocking, 0,
-      (size_t)256 * nnXLen * nnYLen * batchSize * sizeof(float),
-      inputBuffers->trunkResults, 0, NULL, NULL
-    );
-    CHECK_ERR(err);
+    int trunkCh = gpuHandle->model->trunk->trunkNumChannels;
+    size_t trunkElts = (size_t)trunkCh * nnXLen * nnYLen * batchSize;
+    if(useFP16Storage) {
+      err = clEnqueueReadBuffer(
+        handle->commandQueue, gpuHandle->buffers->trunk, blocking, 0,
+        trunkElts * sizeof(half_t), inputBuffers->trunkResultsHalf, 0, NULL, NULL
+      );
+      CHECK_ERR(err);
+      for(size_t i = 0; i < trunkElts; i++)
+        inputBuffers->trunkResults[i] = (float)inputBuffers->trunkResultsHalf[i];
+    } else {
+      err = clEnqueueReadBuffer(
+        handle->commandQueue, gpuHandle->buffers->trunk, blocking, 0,
+        trunkElts * sizeof(float), inputBuffers->trunkResults, 0, NULL, NULL
+      );
+      CHECK_ERR(err);
+    }
   }
 
   err = clEnqueueReadBuffer(
