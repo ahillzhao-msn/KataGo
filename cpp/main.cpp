@@ -40,6 +40,7 @@ tuner : (OpenCL only) Run tuning to find and optimize parameters that work on yo
 
 ---Selfplay training subcommands---------
 
+batch_analysis : Batch analysis of SGF games: extract head(12)+trunk(256)+pick(256) features. NPZ output. Inspired by go-analyzer preprocessing pipeline.
 selfplay : Play selfplay games and generate training data.
 gatekeeper : Poll directory for new nets and match them against the latest net so far.
 
@@ -87,6 +88,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::tuner(subArgs);
   else if(subcommand == "match")
     return MainCmds::match(subArgs);
+  else if(subcommand == "batch_analysis")
+    return MainCmds::batch_analysis(subArgs);
   else if(subcommand == "selfplay")
     return MainCmds::selfplay(subArgs);
   else if(subcommand == "testgpuerror")
