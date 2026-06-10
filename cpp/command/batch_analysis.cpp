@@ -44,6 +44,8 @@ namespace MainCmds {
 
 static const int SCALAR_DIM       = 10;
 static const int HUMAN_CANDIDATES = 3;   // rank profiles tested per player per game
+static const int MAX_GAME_MOVES   = 800; // truncate games longer than this (corrupted SGF guard)
+static const int MAX_HUMAN_MOVES  = 400; // cap HumanSL pass moves to prevent runaway
 
 // 29 profiles ordered weakest → strongest (idx 0=20k … idx 28=9d)
 static const int NUM_RANK_PROFILES = 29;
@@ -298,14 +300,31 @@ static void runHumanSLPass(
   float sumLogB[HUMAN_CANDIDATES] = {}, sumLogW[HUMAN_CANDIDATES] = {};
   int   cntB  [HUMAN_CANDIDATES] = {}, cntW  [HUMAN_CANDIDATES] = {};
 
+  int evalMoves = 0;
+  bool evalOk   = true;
+
   for(const Move& move : sgf->moves) {
+    if(!evalOk || evalMoves >= MAX_HUMAN_MOVES) break;
+
     if(move.loc == Board::NULL_LOC) {
+      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+      continue;
+    }
+
+    // Skip evaluation on finished positions but still advance board state.
+    if(history.isGameFinished()) {
       history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
       continue;
     }
 
     Player evalPla = move.pla;
     int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
+
+    // Sanity-check move is within the evaluation grid.
+    if(rowPos < 0 || rowPos >= NNPos::MAX_NN_POLICY_SIZE) {
+      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+      continue;
+    }
 
     const vector<int>& cand = (evalPla == P_BLACK) ? candB : candW;
     float* sumLog = (evalPla == P_BLACK) ? sumLogB : sumLogW;
@@ -323,17 +342,25 @@ static void runHumanSLPass(
       hparams.symmetry = 0;
       hparams.policyOptimism = 0.0;
 
-      humanEval->evaluate(board, history, evalPla, &meta, hparams, hbuf, true, false);
+      try {
+        humanEval->evaluate(board, history, evalPla, &meta, hparams, hbuf, true, false);
+      } catch(const exception& e) {
+        cerr << "HumanSL evaluate exception at move " << evalMoves
+             << " candidate " << k << ": " << e.what() << " — aborting HumanSL pass." << endl;
+        evalOk = false;
+        break;
+      }
 
       if(hbuf.result) {
-        float prob = (rowPos >= 0 && rowPos < NNPos::MAX_NN_POLICY_SIZE)
-                     ? hbuf.result->policyProbs[rowPos] : 0.0f;
+        float prob = hbuf.result->policyProbs[rowPos];
         sumLog[k] += std::log(std::max(prob, 1e-10f));
         cnt[k]++;
       }
     }
 
+    if(!evalOk) break;
     history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+    evalMoves++;
   }
 
   // Pick best candidate for each player
@@ -459,16 +486,22 @@ int batch_analysis(const vector<string>& args) {
       auto& moves = sgf->moves;
       if((int)moves.size() < minMoves) { skipped++; continue; }
 
-    // Validate alternation: reject SGFs with consecutive same-color moves
-    bool altValid = true;
-    for(size_t mi = 1; mi < moves.size(); mi++) {
-      if(moves[mi].pla == moves[mi-1].pla) { altValid = false; break; }
-    }
-    if(!altValid) {
-      // Reject SGFs with consecutive same-color moves (IGS/OGS format issue)
-      cerr << "  Skipping non-alternating SGF: " << entry.sgfPath << endl;
-      failed++; continue;
-    }
+      // Truncate runaway games from corrupted SGFs.
+      const size_t moveLimit = (moves.size() > (size_t)MAX_GAME_MOVES)
+                               ? (size_t)MAX_GAME_MOVES : moves.size();
+      if(moves.size() > (size_t)MAX_GAME_MOVES)
+        cerr << "Warning: game " << gi << " has " << moves.size()
+             << " moves; truncating to " << MAX_GAME_MOVES << endl;
+
+      // Validate alternation: reject SGFs with consecutive same-color moves.
+      bool altValid = true;
+      for(size_t mi = 1; mi < moveLimit; mi++) {
+        if(moves[mi].pla == moves[mi-1].pla) { altValid = false; break; }
+      }
+      if(!altValid) {
+        cerr << "  Skipping non-alternating SGF: " << entry.sgfPath << endl;
+        failed++; continue;
+      }
 
       Rules rules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
       Board board;
@@ -490,9 +523,17 @@ int batch_analysis(const vector<string>& args) {
       int            prevRecordIdx  = -1;
       Player         prevPla        = P_BLACK;
 
-      for(size_t turn = 0; turn < moves.size(); turn++) {
+      bool gameEvalOk = true;
+      for(size_t turn = 0; turn < moveLimit; turn++) {
+        if(!gameEvalOk) break;
         const Move& move = moves[turn];
         if(move.loc == Board::NULL_LOC) {
+          history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+          continue;
+        }
+
+        // Skip evaluation on finished positions.
+        if(history.isGameFinished()) {
           history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
           continue;
         }
@@ -508,7 +549,14 @@ int batch_analysis(const vector<string>& args) {
         MiscNNInputParams params;
         params.symmetry = 0;
         params.policyOptimism = 0.0;
-        nnEval->evaluate(board, history, evalPla, params, nnbuf, true, false);
+        try {
+          nnEval->evaluate(board, history, evalPla, params, nnbuf, true, false);
+        } catch(const exception& e) {
+          cerr << "Evaluate exception at game " << gi << " move " << turn
+               << ": " << e.what() << " — skipping rest of game." << endl;
+          gameEvalOk = false;
+          break;
+        }
         NNOutput* output = nnbuf.result.get();
 
         if(output) {
