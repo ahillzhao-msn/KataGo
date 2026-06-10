@@ -493,16 +493,6 @@ int batch_analysis(const vector<string>& args) {
         cerr << "Warning: game " << gi << " has " << moves.size()
              << " moves; truncating to " << MAX_GAME_MOVES << endl;
 
-      // Validate alternation: reject SGFs with consecutive same-color moves.
-      bool altValid = true;
-      for(size_t mi = 1; mi < moveLimit; mi++) {
-        if(moves[mi].pla == moves[mi-1].pla) { altValid = false; break; }
-      }
-      if(!altValid) {
-        cerr << "  Skipping non-alternating SGF: " << entry.sgfPath << endl;
-        failed++; continue;
-      }
-
       Rules rules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
       Board board;
       BoardHistory history;
@@ -523,6 +513,10 @@ int batch_analysis(const vector<string>& args) {
       int            prevRecordIdx  = -1;
       Player         prevPla        = P_BLACK;
 
+      // Alternation tracking: consecutive same-color stone → truncate, not reject.
+      Player lastStonePla    = P_BLACK;
+      bool   firstStoneSeen  = false;
+
       bool gameEvalOk = true;
       for(size_t turn = 0; turn < moveLimit; turn++) {
         if(!gameEvalOk) break;
@@ -531,6 +525,16 @@ int batch_analysis(const vector<string>& args) {
           history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
           continue;
         }
+
+        // Consecutive same-color stone placement = game effectively ended; keep data so far.
+        if(firstStoneSeen && move.pla == lastStonePla) {
+          cerr << "  Game " << gi << " (" << entry.sgfPath << "): consecutive "
+               << (move.pla == P_BLACK ? "B" : "W") << " at turn " << turn
+               << " — truncating." << endl;
+          break;
+        }
+        lastStonePla   = move.pla;
+        firstStoneSeen = true;
 
         // Skip evaluation on finished positions.
         if(history.isGameFinished()) {
