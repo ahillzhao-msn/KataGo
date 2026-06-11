@@ -40,7 +40,13 @@ tuner : (OpenCL only) Run tuning to find and optimize parameters that work on yo
 
 ---Selfplay training subcommands---------
 
-batch_analysis : Batch analysis of SGF games: extract head(12)+trunk(256)+pick(256) features. NPZ output. Inspired by go-analyzer preprocessing pipeline.
+batch_analysis : Batch SGF analysis with KAB2 feature extraction.
+  Extracts per-move scalars(10) + optional trunk/pick features.
+  Output: KAB2 binary files (_B.npz/_W.npz) or stdout stream.
+  Supports: -human-model (HumanSL rank annotation), -stream (pipe to Python),
+  -no-trunk (scalars-only, 10 dims), -no-compress, configurable visits.
+  Output files named after SGF stem (not hex ids).
+  See 'katago batch_analysis --help' for full usage.
 selfplay : Play selfplay games and generate training data.
 gatekeeper : Poll directory for new nets and match them against the latest net so far.
 
