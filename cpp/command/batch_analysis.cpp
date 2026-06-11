@@ -38,6 +38,11 @@
 #include "../program/setup.h"
 #include <zlib.h>
 
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
+
 using namespace std;
 
 namespace MainCmds {
@@ -191,6 +196,16 @@ static vector<ListEntry> parseList(const string& path) {
   return entries;
 }
 
+static string sgfToBase(const string& sgfPath) {
+  // Extract filename stem from SGF path: strip directory and ".sgf" extension.
+  size_t slash = sgfPath.rfind('/');
+  if(slash == string::npos) slash = sgfPath.rfind('\\');
+  string name = (slash == string::npos) ? sgfPath : sgfPath.substr(slash + 1);
+  if(name.size() > 4 && name.substr(name.size() - 4) == ".sgf")
+    name = name.substr(0, name.size() - 4);
+  return name;
+}
+
 static vector<char> zlibCompress(const char* data, size_t bytes) {
   if(bytes == 0) return {};
   uLongf clen = compressBound((uLong)bytes);
@@ -202,14 +217,14 @@ static vector<char> zlibCompress(const char* data, size_t bytes) {
   return out;
 }
 
-static void writePlayerFile(
-  const string& path, const vector<float>& movesData,
+// Serialise one player's data into an in-memory KAB2 buffer.
+// trunkCh == 0 produces scalars-only (lite) mode.
+static vector<char> serializePlayer(
+  const vector<float>& movesData,
   int numMoves, int trunkCh, int nnXLen, int nnYLen,
   bool doCompress, const PlayerSummary& summary
 ) {
-  if(numMoves < 1) return;
-  ofstream out(path, ios::binary);
-  if(!out) { cerr << "Cannot write: " << path << endl; return; }
+  if(numMoves < 1) return {};
 
   NPZHeader hdr;
   memcpy(hdr.magic, "KAB2", 4);
@@ -221,18 +236,44 @@ static void writePlayerFile(
   hdr.nnYLen    = (int32_t)nnYLen;
   hdr.flags     = doCompress ? 1 : 0;
   hdr.summary   = summary;
-  out.write((const char*)&hdr, sizeof(hdr));
+
+  vector<char> buf(sizeof(hdr));
+  memcpy(buf.data(), &hdr, sizeof(hdr));
 
   const char* raw  = (const char*)movesData.data();
   size_t      rawB = movesData.size() * sizeof(float);
   if(doCompress) {
     vector<char> comp = zlibCompress(raw, rawB);
     int32_t clen = (int32_t)comp.size();
-    out.write((const char*)&clen, 4);
-    out.write(comp.data(), clen);
+    size_t prev = buf.size();
+    buf.resize(prev + 4 + comp.size());
+    memcpy(buf.data() + prev, &clen, 4);
+    memcpy(buf.data() + prev + 4, comp.data(), comp.size());
   } else {
-    out.write(raw, rawB);
+    buf.insert(buf.end(), raw, raw + rawB);
   }
+  return buf;
+}
+
+static void writePlayerFile(
+  const string& path, const vector<float>& movesData,
+  int numMoves, int trunkCh, int nnXLen, int nnYLen,
+  bool doCompress, const PlayerSummary& summary
+) {
+  if(numMoves < 1) return;
+  ofstream out(path, ios::binary);
+  if(!out) { cerr << "Cannot write: " << path << endl; return; }
+  auto buf = serializePlayer(movesData, numMoves, trunkCh, nnXLen, nnYLen, doCompress, summary);
+  out.write(buf.data(), buf.size());
+}
+
+// Stream one frame to stdout: [side 'B'/'W'][uint32 size][payload]
+static void streamPlayer(char side, const vector<char>& payload) {
+  uint32_t sz = (uint32_t)payload.size();
+  cout.write(&side, 1);
+  cout.write(reinterpret_cast<const char*>(&sz), 4);
+  cout.write(payload.data(), (streamsize)payload.size());
+  cout.flush();
 }
 
 // Append one move's feature block.
@@ -312,7 +353,7 @@ static void runHumanSLPass(
     }
 
     // Skip evaluation on finished positions but still advance board state.
-    if(history.isGameFinished()) {
+    if(history.isGameFinished) {
       history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
       continue;
     }
@@ -395,6 +436,8 @@ int batch_analysis(const vector<string>& args) {
   string listFile, sgfDir, outputDir = ".";
   int visits = 0, minMoves = 10, maxGames = 0;
   bool noCompress = false;
+  bool streamMode = false;   // -stream: write frames to stdout instead of files
+  bool noTrunk    = false;   // -no-trunk: scalars only (10 floats/move), skip trunk/pick
 
   for(size_t i = 1; i < args.size(); i++) {
     if     (args[i] == "-config"      && i+1 < args.size()) configFile     = args[++i];
@@ -407,14 +450,23 @@ int batch_analysis(const vector<string>& args) {
     else if(args[i] == "-min-moves"   && i+1 < args.size()) minMoves       = stoi(args[++i]);
     else if(args[i] == "-max-games"   && i+1 < args.size()) maxGames       = stoi(args[++i]);
     else if(args[i] == "-no-compress") noCompress = true;
+    else if(args[i] == "-stream")      streamMode = true;
+    else if(args[i] == "-no-trunk")    noTrunk    = true;
     else { cerr << "Unknown argument: " << args[i] << endl; return 1; }
   }
 
   if(modelFile.empty()) {
     cerr << "Usage: katago batch_analysis -model <model.bin.gz> [-config <cfg>]" << endl;
     cerr << "  [-list <games.csv> | -sgf-dir <dir/>] [-output-dir <out/>]" << endl;
-    cerr << "  [-visits N] [-min-moves N] [-max-games N] [-no-compress]" << endl;
+    cerr << "  [-visits N] [-min-moves N] [-max-games N]" << endl;
+    cerr << "  [-no-compress] [-stream] [-no-trunk]" << endl;
     cerr << "  [-human-model <human.bin.gz>]" << endl;
+    cerr << endl;
+    cerr << "  -stream    Write KAB2 frames to stdout instead of files." << endl;
+    cerr << "             Protocol: ['B'/'W'][uint32 size][KAB2 payload] per player," << endl;
+    cerr << "             terminated by a single 0x00 byte." << endl;
+    cerr << "  -no-trunk  Scalars only (10 floats/move). Omits trunk/pick vectors." << endl;
+    cerr << "             Useful for fast rank assessment without training features." << endl;
     return 1;
   }
 
@@ -431,7 +483,7 @@ int batch_analysis(const vector<string>& args) {
   if(entries.empty()) { cerr << "No games found (provide -list or -sgf-dir)" << endl; return 1; }
   if(maxGames > 0 && (int)entries.size() > maxGames) entries.resize(maxGames);
 
-  ensureDir(outputDir);
+  if(!streamMode) ensureDir(outputDir);
 
   Logger logger;
   Rand seedRand;
@@ -447,8 +499,9 @@ int batch_analysis(const vector<string>& args) {
   if(!nnEval) { cerr << "Failed to load model: " << modelFile << endl; return 1; }
   nnXLen = nnEval->getNNXLen();
   nnYLen = nnEval->getNNYLen();
-  const int trunkCh = nnEval->getModelTrunkNumChannels();
-  const int moveDim = SCALAR_DIM + 2 * trunkCh;
+  const int trunkChFull = nnEval->getModelTrunkNumChannels();
+  const int trunkCh     = noTrunk ? 0 : trunkChFull;  // 0 = scalars-only mode
+  const int moveDim     = SCALAR_DIM + 2 * trunkCh;
 
   // Optional HumanSL evaluator
   NNEvaluator* humanEval = nullptr;
@@ -466,18 +519,24 @@ int batch_analysis(const vector<string>& args) {
 
   (void)visits;  // reserved for future MCTS depth control
 
-  cout << "batch-analysis: " << entries.size() << " games"
-       << "  trunkCh=" << trunkCh << "  moveDim=" << moveDim
+#ifdef _WIN32
+  // Binary mode for stdout — prevents CRLF conversion corrupting binary frames
+  _setmode(_fileno(stdout), _O_BINARY);
+#endif
+
+  cerr << "batch-analysis: " << entries.size() << " games"
+       << "  trunkCh=" << trunkChFull << "  moveDim=" << (SCALAR_DIM + 2 * trunkChFull)
        << "  headerBytes=" << sizeof(NPZHeader);
-  if(humanEval) cout << "  [+HumanSL x" << HUMAN_CANDIDATES << "]";
-  cout << "  output=" << outputDir << endl;
+  if(humanEval) cerr << "  [+HumanSL x" << HUMAN_CANDIDATES << "]";
+  if(streamMode) cerr << "  [stream mode" << (noTrunk ? " lite" : "") << "]";
+  cerr << "  output=" << (streamMode ? "stdout" : outputDir) << endl;
 
   bool metaHeaderWritten = false;
   int success = 0, failed = 0, skipped = 0;
 
   for(size_t gi = 0; gi < entries.size(); gi++) {
     const auto& entry = entries[gi];
-    const string base = "game_" + Global::uint64ToHexString(gi);
+    const string base = sgfToBase(entry.sgfPath);
 
     try {
       auto sgf = CompactSgf::loadFile(entry.sgfPath);
@@ -537,7 +596,7 @@ int batch_analysis(const vector<string>& args) {
         firstStoneSeen = true;
 
         // Skip evaluation on finished positions.
-        if(history.isGameFinished()) {
+        if(history.isGameFinished) {
           history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
           continue;
         }
@@ -547,7 +606,7 @@ int batch_analysis(const vector<string>& args) {
 
         NNResultBuf nnbuf;
         nnbuf.result = std::make_shared<NNOutput>();
-        nnbuf.result->includeTrunk = true;
+        nnbuf.result->includeTrunk = !noTrunk;  // skip trunk in lite mode
         nnbuf.result->includePick  = false;  // we extract pick from trunk directly
 
         MiscNNInputParams params;
@@ -633,13 +692,24 @@ int batch_analysis(const vector<string>& args) {
         }
       }
 
-      // ── Write per-player NPZ files ────────────────────────────────────────
-      if(nBlack >= 5)
-        writePlayerFile(outputDir + "/" + base + "_B.npz",
-                        data_B, nBlack, trunkCh, nnXLen, nnYLen, !noCompress, sb);
-      if(nWhite >= 5)
-        writePlayerFile(outputDir + "/" + base + "_W.npz",
-                        data_W, nWhite, trunkCh, nnXLen, nnYLen, !noCompress, sw);
+      // ── Output: stream to stdout or write files ───────────────────────────
+      if(streamMode) {
+        if(nBlack >= 5) {
+          auto buf = serializePlayer(data_B, nBlack, trunkCh, nnXLen, nnYLen, !noCompress, sb);
+          streamPlayer('B', buf);
+        }
+        if(nWhite >= 5) {
+          auto buf = serializePlayer(data_W, nWhite, trunkCh, nnXLen, nnYLen, !noCompress, sw);
+          streamPlayer('W', buf);
+        }
+      } else {
+        if(nBlack >= 5)
+          writePlayerFile(outputDir + "/" + base + "_B.npz",
+                          data_B, nBlack, trunkCh, nnXLen, nnYLen, !noCompress, sb);
+        if(nWhite >= 5)
+          writePlayerFile(outputDir + "/" + base + "_W.npz",
+                          data_W, nWhite, trunkCh, nnXLen, nnYLen, !noCompress, sw);
+      }
 
       // ── Meta CSV ──────────────────────────────────────────────────────────
       if(!metaHeaderWritten) {
@@ -675,18 +745,26 @@ int batch_analysis(const vector<string>& args) {
     }
 
     if((gi+1) % 10 == 0 || gi == entries.size()-1) {
-      cout << "  [" << (gi+1) << "/" << entries.size() << "]"
+      cerr << "  [" << (gi+1) << "/" << entries.size() << "]"
            << "  ok=" << success << " skip=" << skipped << " fail=" << failed << endl;
     }
   }
 
-  cout << "\n=== batch-analysis complete ===" << endl;
-  cout << "  total=" << entries.size()
+  if(streamMode) {
+    // Terminator: single 0x00 byte signals end-of-stream to Python reader
+    char terminator = 0;
+    cout.write(&terminator, 1);
+    cout.flush();
+  }
+
+  cerr << "\n=== batch-analysis complete ===" << endl;
+  cerr << "  total=" << entries.size()
        << "  ok=" << success << "  skipped(<" << minMoves << "mv)=" << skipped
        << "  failed=" << failed << endl;
-  cout << "  format: KAB2  scalarDim=" << SCALAR_DIM
-       << "  trunkCh=" << trunkCh << "  moveDim=" << moveDim << endl;
-  cout << "  output: " << outputDir << "/" << endl;
+  cerr << "  format: KAB2  scalarDim=" << SCALAR_DIM
+       << "  trunkCh=" << trunkCh
+       << (noTrunk ? " [lite/no-trunk]" : "") << "  moveDim=" << moveDim << endl;
+  if(!streamMode) cerr << "  output: " << outputDir << "/" << endl;
   return 0;
 }
 
