@@ -435,6 +435,7 @@ int batch_analysis(const vector<string>& args) {
   string modelFile, configFile, humanModelFile;
   string listFile, sgfDir, outputDir = ".";
   int visits = 0, minMoves = 10, maxGames = 0;
+  int maxBatchSize = 64;   // NN batch size for NNEvaluator; higher = larger GPU batches
   bool noCompress = false;
   bool streamMode = false;   // -stream: write frames to stdout instead of files
   bool noTrunk    = false;   // -no-trunk: scalars only (10 floats/move), skip trunk/pick
@@ -449,6 +450,7 @@ int batch_analysis(const vector<string>& args) {
     else if(args[i] == "-visits"      && i+1 < args.size()) visits         = stoi(args[++i]);
     else if(args[i] == "-min-moves"   && i+1 < args.size()) minMoves       = stoi(args[++i]);
     else if(args[i] == "-max-games"   && i+1 < args.size()) maxGames       = stoi(args[++i]);
+    else if(args[i] == "-batch-size"  && i+1 < args.size()) maxBatchSize   = stoi(args[++i]);
     else if(args[i] == "-no-compress") noCompress = true;
     else if(args[i] == "-stream")      streamMode = true;
     else if(args[i] == "-no-trunk")    noTrunk    = true;
@@ -460,6 +462,7 @@ int batch_analysis(const vector<string>& args) {
     cerr << "  [-list <games.csv> | -sgf-dir <dir/>] [-output-dir <out/>]" << endl;
     cerr << "  [-visits N] [-min-moves N] [-max-games N]" << endl;
     cerr << "  [-no-compress] [-stream] [-no-trunk]" << endl;
+    cerr << "  [-batch-size N (default 64)]" << endl;
     cerr << "  [-human-model <human.bin.gz>]" << endl;
     cerr << endl;
     cerr << "  -stream    Write KAB2 frames to stdout instead of files." << endl;
@@ -493,7 +496,7 @@ int batch_analysis(const vector<string>& args) {
 
   int nnXLen = 19, nnYLen = 19;
   auto nnEval = Setup::initializeNNEvaluator(
-    modelFile, modelFile, "", cfg, logger, seedRand, 64,
+    modelFile, modelFile, "", cfg, logger, seedRand, maxBatchSize,
     nnXLen, nnYLen, 64, true, false, Setup::SETUP_FOR_ANALYSIS
   );
   if(!nnEval) { cerr << "Failed to load model: " << modelFile << endl; return 1; }
@@ -507,7 +510,7 @@ int batch_analysis(const vector<string>& args) {
   NNEvaluator* humanEval = nullptr;
   if(!humanModelFile.empty()) {
     humanEval = Setup::initializeNNEvaluator(
-      humanModelFile, humanModelFile, "", cfg, logger, seedRand, 64,
+      humanModelFile, humanModelFile, "", cfg, logger, seedRand, maxBatchSize,
       nnXLen, nnYLen, 64, true, false, Setup::SETUP_FOR_ANALYSIS
     );
     if(!humanEval)
