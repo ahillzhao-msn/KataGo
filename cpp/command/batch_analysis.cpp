@@ -37,6 +37,7 @@
 #include "../program/play.h"
 #include "../program/setup.h"
 #include <zlib.h>
+#include <chrono>
 
 #ifdef _WIN32
 #include <io.h>
@@ -436,6 +437,7 @@ int batch_analysis(const vector<string>& args) {
   string listFile, sgfDir, outputDir = ".";
   int visits = 0, minMoves = 10, maxGames = 0;
   int maxBatchSize = 64;   // NN batch size for NNEvaluator; higher = larger GPU batches
+  bool profile     = false; // hidden: print per-game timing breakdown
   bool noCompress = false;
   bool streamMode = false;   // -stream: write frames to stdout instead of files
   bool noTrunk    = false;   // -no-trunk: scalars only (10 floats/move), skip trunk/pick
@@ -454,6 +456,7 @@ int batch_analysis(const vector<string>& args) {
     else if(args[i] == "-no-compress") noCompress = true;
     else if(args[i] == "-stream")      streamMode = true;
     else if(args[i] == "-no-trunk")    noTrunk    = true;
+    else if(args[i] == "-profile")     profile    = true;
     else { cerr << "Unknown argument: " << args[i] << endl; return 1; }
   }
 
@@ -537,7 +540,15 @@ int batch_analysis(const vector<string>& args) {
   bool metaHeaderWritten = false;
   int success = 0, failed = 0, skipped = 0;
 
+  // Profiling accumulators
+  double totalNNEvalMs = 0.0;
+  double totalGameMs   = 0.0;
+  int     totalMoves   = 0;
+  using Clock = chrono::steady_clock;
+
   for(size_t gi = 0; gi < entries.size(); gi++) {
+    Clock::time_point gameStart = Clock::now();
+    double gameNNEvalMs = 0.0;
     const auto& entry = entries[gi];
     const string base = sgfToBase(entry.sgfPath);
 
@@ -616,7 +627,11 @@ int batch_analysis(const vector<string>& args) {
         params.symmetry = 0;
         params.policyOptimism = 0.0;
         try {
+          Clock::time_point t0 = Clock::now();
           nnEval->evaluate(board, history, evalPla, params, nnbuf, true, false);
+          Clock::time_point t1 = Clock::now();
+          double evalMs = chrono::duration<double, milli>(t1 - t0).count();
+          gameNNEvalMs += evalMs;
         } catch(const exception& e) {
           cerr << "Evaluate exception at game " << gi << " move " << turn
                << ": " << e.what() << " — skipping rest of game." << endl;
@@ -693,6 +708,16 @@ int batch_analysis(const vector<string>& args) {
           cerr << "HumanSL pass failed for game " << gi << ": " << e.what() << endl;
           // sb/sw.humanRankIdx stays -1
         }
+      }
+
+      // ── Per-game profile ────────────────────────────────────────────────
+      if(profile) {
+        Clock::time_point gameEnd = Clock::now();
+        double gameMs = chrono::duration<double, milli>(gameEnd - gameStart).count();
+        totalNNEvalMs += gameNNEvalMs;
+        totalGameMs   += gameMs;
+        totalMoves    += (nBlack + nWhite);
+        cerr << "  [profile] game " << gi << " \"" << base << "\": " << gameMs << " ms  (nnEval " << gameNNEvalMs << " ms / " << (nBlack + nWhite) << " moves = " << (gameNNEvalMs / max(1, nBlack + nWhite)) << " ms/eval)" << (humanEval ? " [+HumanSL]" : "") << endl;
       }
 
       // ── Output: stream to stdout or write files ───────────────────────────
