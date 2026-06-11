@@ -438,7 +438,6 @@ int batch_analysis(const vector<string>& args) {
   int visits = 0, minMoves = 10, maxGames = 0;
   int maxBatchSize = 64;   // NN batch size for NNEvaluator; higher = larger GPU batches
   bool profile     = false; // hidden: print per-game timing breakdown
-  bool noCompress = false;
   bool streamMode = false;   // -stream: write frames to stdout instead of files
   bool noTrunk    = false;   // -no-trunk: scalars only (10 floats/move), skip trunk/pick
 
@@ -453,7 +452,6 @@ int batch_analysis(const vector<string>& args) {
     else if(args[i] == "-min-moves"   && i+1 < args.size()) minMoves       = stoi(args[++i]);
     else if(args[i] == "-max-games"   && i+1 < args.size()) maxGames       = stoi(args[++i]);
     else if(args[i] == "-batch-size"  && i+1 < args.size()) maxBatchSize   = stoi(args[++i]);
-    else if(args[i] == "-no-compress") noCompress = true;
     else if(args[i] == "-stream")      streamMode = true;
     else if(args[i] == "-no-trunk")    noTrunk    = true;
     else if(args[i] == "-profile")     profile    = true;
@@ -464,7 +462,7 @@ int batch_analysis(const vector<string>& args) {
     cerr << "Usage: katago batch_analysis -model <model.bin.gz> [-config <cfg>]" << endl;
     cerr << "  [-list <games.csv> | -sgf-dir <dir/>] [-output-dir <out/>]" << endl;
     cerr << "  [-visits N] [-min-moves N] [-max-games N]" << endl;
-    cerr << "  [-no-compress] [-stream] [-no-trunk]" << endl;
+    cerr << "  [-stream] [-no-trunk]" << endl;
     cerr << "  [-batch-size N (default 64)]" << endl;
     cerr << "  [-human-model <human.bin.gz>]" << endl;
     cerr << endl;
@@ -723,20 +721,30 @@ int batch_analysis(const vector<string>& args) {
       // ── Output: stream to stdout or write files ───────────────────────────
       if(streamMode) {
         if(nBlack >= 5) {
-          auto buf = serializePlayer(data_B, nBlack, trunkCh, nnXLen, nnYLen, !noCompress, sb);
+          auto buf = serializePlayer(data_B, nBlack, trunkCh, nnXLen, nnYLen, false, sb);
           streamPlayer('B', buf);
         }
         if(nWhite >= 5) {
-          auto buf = serializePlayer(data_W, nWhite, trunkCh, nnXLen, nnYLen, !noCompress, sw);
+          auto buf = serializePlayer(data_W, nWhite, trunkCh, nnXLen, nnYLen, false, sw);
           streamPlayer('W', buf);
         }
       } else {
-        if(nBlack >= 5)
-          writePlayerFile(outputDir + "/" + base + "_B.npz",
-                          data_B, nBlack, trunkCh, nnXLen, nnYLen, !noCompress, sb);
-        if(nWhite >= 5)
-          writePlayerFile(outputDir + "/" + base + "_W.npz",
-                          data_W, nWhite, trunkCh, nnXLen, nnYLen, !noCompress, sw);
+        // ── Combined KAB2 pair file (single .npz, always compressed) ───
+        // Format: [4B B_size][B_KAB2_compressed][4B W_size][W_KAB2_compressed]
+        auto bufB = (nBlack >= 5) ? serializePlayer(data_B, nBlack, trunkCh, nnXLen, nnYLen, true, sb)
+                                  : vector<char>();
+        auto bufW = (nWhite >= 5) ? serializePlayer(data_W, nWhite, trunkCh, nnXLen, nnYLen, true, sw)
+                                  : vector<char>();
+        string outPath = outputDir + "/" + base + ".npz";
+        ofstream ofs(outPath, ios::binary);
+        if(ofs) {
+          uint32_t bSz = (uint32_t)bufB.size();
+          uint32_t wSz = (uint32_t)bufW.size();
+          ofs.write(reinterpret_cast<const char*>(&bSz), 4);
+          if(bSz > 0) ofs.write(bufB.data(), bSz);
+          ofs.write(reinterpret_cast<const char*>(&wSz), 4);
+          if(wSz > 0) ofs.write(bufW.data(), wSz);
+        }
       }
 
       // ── Meta CSV ──────────────────────────────────────────────────────────
