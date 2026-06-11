@@ -32,6 +32,37 @@ with open('game_B.npz','rb') as f:
     arr = np.frombuffer(trunk, dtype=np.float32).reshape(n, tk, nx, ny)
 ```
 
+## Stream / Lite Mode (v1.16.5-trunk-stream)
+
+```bash
+# Stream mode: pipe KAB2 frames to stdout (zero disk I/O)
+# Protocol: [1 byte 'B'/'W'][4 bytes uint32 size][KAB2 payload] per player
+# Terminated by 0x00 byte. Progress on stderr.
+katago batch_analysis \
+  -model model.bin.gz \
+  -list games.csv \
+  -stream
+
+# Lite mode: scalars only (10 floats/move), 100x smaller
+# Skips trunk/pick computation — ideal for rank inference
+katago batch_analysis \
+  -model model.bin.gz \
+  -list games.csv \
+  -stream -no-trunk
+
+# HumanSL rank annotation (optional second pass)
+katago batch_analysis \
+  -model model.bin.gz \
+  -list games.csv \
+  -stream -no-trunk \
+  -human-model humansl.bin.gz
+```
+
+## SGF filename naming
+
+Output files are named after the original SGF filename (not hex ids).
+Meta CSV includes `sgf_path` column. Supports `../` relative paths.
+
 ## Quick Start
 
 ```bash
