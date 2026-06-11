@@ -1,6 +1,13 @@
 // batch_analysis.cpp — Batch SGF analysis with per-move + per-game feature extraction
 //
-// Output format KAB2 (per-player files _B.npz / _W.npz):
+// Output formats:
+//   File mode:   one combined <sgf-stem>.npz per game (always zlib compressed):
+//                [4B B_size][B KAB2 payload][4B W_size][W KAB2 payload]
+//   Stream mode: uncompressed per-player frames on stdout:
+//                [1B side 'B'/'W'][4B uint32 idLen][game id][4B uint32 size][KAB2 payload]
+//                terminated by a single 0x00 byte. Game id = SGF filename stem.
+//
+// KAB2 payload:
 //   NPZHeader (96 bytes, embeds PlayerSummary) |
 //   [ scalars(10) + pick(C) + avgTrunk(C) ] × N  [optionally zlib]
 //
@@ -20,7 +27,12 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#ifdef _WIN32
 #include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -172,7 +184,11 @@ struct ListEntry {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+#ifdef _WIN32
 static void ensureDir(const string& path) { _mkdir(path.c_str()); }
+#else
+static void ensureDir(const string& path) { mkdir(path.c_str(), 0755); }
+#endif
 
 static vector<ListEntry> parseList(const string& path) {
   vector<ListEntry> entries;
@@ -268,10 +284,15 @@ static void writePlayerFile(
   out.write(buf.data(), buf.size());
 }
 
-// Stream one frame to stdout: [side 'B'/'W'][uint32 size][payload]
-static void streamPlayer(char side, const vector<char>& payload) {
-  uint32_t sz = (uint32_t)payload.size();
+// Stream one frame to stdout: [side 'B'/'W'][uint32 idLen][game id][uint32 size][payload]
+// Game id (SGF filename stem) lets the Python reader pair B/W frames and map
+// results back to input games even when one side is missing.
+static void streamPlayer(char side, const string& gameId, const vector<char>& payload) {
+  uint32_t idLen = (uint32_t)gameId.size();
+  uint32_t sz    = (uint32_t)payload.size();
   cout.write(&side, 1);
+  cout.write(reinterpret_cast<const char*>(&idLen), 4);
+  cout.write(gameId.data(), (streamsize)gameId.size());
   cout.write(reinterpret_cast<const char*>(&sz), 4);
   cout.write(payload.data(), (streamsize)payload.size());
   cout.flush();
@@ -405,10 +426,11 @@ static void runHumanSLPass(
     evalMoves++;
   }
 
-  // Pick best candidate for each player
+  // Pick best candidate for each player; {-1, 0} if nothing was evaluated
+  // (e.g. exception on the very first move) so humanRankIdx stays unset.
   auto selectBest = [](const float sl[], const int ct[],
                        const vector<int>& cand) -> pair<int,float> {
-    int   bestK    = 0;
+    int   bestK    = -1;
     float bestMean = -1e20f;
     for(int k = 0; k < HUMAN_CANDIDATES; k++) {
       if(ct[k] > 0) {
@@ -416,6 +438,7 @@ static void runHumanSLPass(
         if(m > bestMean) { bestMean = m; bestK = k; }
       }
     }
+    if(bestK < 0) return {-1, 0.0f};
     return {cand[bestK], bestMean};
   };
 
@@ -440,6 +463,7 @@ int batch_analysis(const vector<string>& args) {
   bool profile     = false; // hidden: print per-game timing breakdown
   bool streamMode = false;   // -stream: write frames to stdout instead of files
   bool noTrunk    = false;   // -no-trunk: scalars only (10 floats/move), skip trunk/pick
+  bool daemonMode = false;   // -daemon: persistent process, jobs fed via stdin
 
   for(size_t i = 1; i < args.size(); i++) {
     if     (args[i] == "-config"      && i+1 < args.size()) configFile     = args[++i];
@@ -454,6 +478,7 @@ int batch_analysis(const vector<string>& args) {
     else if(args[i] == "-batch-size"  && i+1 < args.size()) maxBatchSize   = stoi(args[++i]);
     else if(args[i] == "-stream")      streamMode = true;
     else if(args[i] == "-no-trunk")    noTrunk    = true;
+    else if(args[i] == "-daemon")      daemonMode = true;
     else if(args[i] == "-profile")     profile    = true;
     else { cerr << "Unknown argument: " << args[i] << endl; return 1; }
   }
@@ -467,25 +492,33 @@ int batch_analysis(const vector<string>& args) {
     cerr << "  [-human-model <human.bin.gz>]" << endl;
     cerr << endl;
     cerr << "  -stream    Write KAB2 frames to stdout instead of files." << endl;
-    cerr << "             Protocol: ['B'/'W'][uint32 size][KAB2 payload] per player," << endl;
-    cerr << "             terminated by a single 0x00 byte." << endl;
+    cerr << "             Protocol: ['B'/'W'][uint32 idLen][game id][uint32 size][KAB2 payload]" << endl;
+    cerr << "             per player, terminated by a single 0x00 byte." << endl;
     cerr << "  -no-trunk  Scalars only (10 floats/move). Omits trunk/pick vectors." << endl;
     cerr << "             Useful for fast rank assessment without training features." << endl;
+    cerr << "  -daemon    Persistent mode: keep models loaded, read job lines from" << endl;
+    cerr << "             stdin (each line = path to a games.csv; 'quit' exits)." << endl;
+    cerr << "             Implies -stream; each job's frames end with a 0x01 byte." << endl;
     return 1;
   }
 
+  // Daemon mode delivers results as stream frames; file output is not supported.
+  if(daemonMode) streamMode = true;
+
   vector<ListEntry> entries;
-  if(!listFile.empty())
-    entries = parseList(listFile);
-  if(entries.empty() && !sgfDir.empty()) {
-    vector<string> sgfFiles;
-    FileUtils::collectFiles(sgfDir,
-      [](const string& n){ return n.size() >= 4 && n.substr(n.size()-4) == ".sgf"; },
-      sgfFiles);
-    for(const auto& f : sgfFiles) { ListEntry e; e.sgfPath = f; entries.push_back(e); }
+  if(!daemonMode) {
+    if(!listFile.empty())
+      entries = parseList(listFile);
+    if(entries.empty() && !sgfDir.empty()) {
+      vector<string> sgfFiles;
+      FileUtils::collectFiles(sgfDir,
+        [](const string& n){ return n.size() >= 4 && n.substr(n.size()-4) == ".sgf"; },
+        sgfFiles);
+      for(const auto& f : sgfFiles) { ListEntry e; e.sgfPath = f; entries.push_back(e); }
+    }
+    if(entries.empty()) { cerr << "No games found (provide -list or -sgf-dir)" << endl; return 1; }
+    if(maxGames > 0 && (int)entries.size() > maxGames) entries.resize(maxGames);
   }
-  if(entries.empty()) { cerr << "No games found (provide -list or -sgf-dir)" << endl; return 1; }
-  if(maxGames > 0 && (int)entries.size() > maxGames) entries.resize(maxGames);
 
   if(!streamMode) ensureDir(outputDir);
 
@@ -528,11 +561,13 @@ int batch_analysis(const vector<string>& args) {
   _setmode(_fileno(stdout), _O_BINARY);
 #endif
 
-  cerr << "batch-analysis: " << entries.size() << " games"
+  cerr << "batch-analysis: "
+       << (daemonMode ? string("daemon") : std::to_string(entries.size()) + " games")
        << "  trunkCh=" << trunkChFull << "  moveDim=" << (SCALAR_DIM + 2 * trunkChFull)
        << "  headerBytes=" << sizeof(NPZHeader);
   if(humanEval) cerr << "  [+HumanSL x" << HUMAN_CANDIDATES << "]";
   if(streamMode) cerr << "  [stream mode" << (noTrunk ? " lite" : "") << "]";
+  if(daemonMode) cerr << "  [daemon]";
   cerr << "  output=" << (streamMode ? "stdout" : outputDir) << endl;
 
   bool metaHeaderWritten = false;
@@ -544,10 +579,13 @@ int batch_analysis(const vector<string>& args) {
   int     totalMoves   = 0;
   using Clock = chrono::steady_clock;
 
-  for(size_t gi = 0; gi < entries.size(); gi++) {
+  // Process one batch of entries. Captures evaluators, counters, and mode
+  // flags by reference so daemon mode can reuse it per job.
+  auto processEntries = [&](const vector<ListEntry>& jobEntries) {
+  for(size_t gi = 0; gi < jobEntries.size(); gi++) {
     Clock::time_point gameStart = Clock::now();
     double gameNNEvalMs = 0.0;
-    const auto& entry = entries[gi];
+    const auto& entry = jobEntries[gi];
     const string base = sgfToBase(entry.sgfPath);
 
     try {
@@ -722,11 +760,11 @@ int batch_analysis(const vector<string>& args) {
       if(streamMode) {
         if(nBlack >= 5) {
           auto buf = serializePlayer(data_B, nBlack, trunkCh, nnXLen, nnYLen, false, sb);
-          streamPlayer('B', buf);
+          streamPlayer('B', base, buf);
         }
         if(nWhite >= 5) {
           auto buf = serializePlayer(data_W, nWhite, trunkCh, nnXLen, nnYLen, false, sw);
-          streamPlayer('W', buf);
+          streamPlayer('W', base, buf);
         }
       } else {
         // ── Combined KAB2 pair file (single .npz, always compressed) ───
@@ -747,7 +785,8 @@ int batch_analysis(const vector<string>& args) {
         }
       }
 
-      // ── Meta CSV ──────────────────────────────────────────────────────────
+      // ── Meta CSV (file mode only — stream mode must not touch disk) ──────
+      if(!streamMode) {
       if(!metaHeaderWritten) {
         ofstream hdr(outputDir + "/_meta.csv");
         if(hdr)
@@ -773,6 +812,7 @@ int batch_analysis(const vector<string>& args) {
                << sw.scoreVariance << "," << sw.approxScoreDrop << ","
                << rankIdxToStr(sw.humanRankIdx) << "," << sw.humanLogPrior << "\n";
       }
+      }
 
       success++;
     } catch(const exception& e) {
@@ -780,10 +820,53 @@ int batch_analysis(const vector<string>& args) {
       failed++;
     }
 
-    if((gi+1) % 10 == 0 || gi == entries.size()-1) {
-      cerr << "  [" << (gi+1) << "/" << entries.size() << "]"
+    if((gi+1) % 10 == 0 || gi == jobEntries.size()-1) {
+      cerr << "  [" << (gi+1) << "/" << jobEntries.size() << "]"
            << "  ok=" << success << " skip=" << skipped << " fail=" << failed << endl;
     }
+  }
+  };  // processEntries
+
+  if(daemonMode) {
+    // Persistent loop: one job per stdin line (path to a games.csv).
+    // Each job's frames are followed by a 0x01 marker; a final 0x00
+    // terminator is written when the daemon exits.
+    cerr << "daemon: ready" << endl;
+    string line;
+    while(getline(cin, line)) {
+      while(!line.empty() && (line.back() == '\r' || line.back() == ' '))
+        line.pop_back();
+      if(line.empty()) continue;
+      if(line == "quit") break;
+
+      // Soft reset: clear NN caches and counters, keep models loaded.
+      // Acknowledged with the same 0x01 marker as a job.
+      if(line == "reset") {
+        nnEval->clearCache();
+        if(humanEval) humanEval->clearCache();
+        success = failed = skipped = 0;
+        totalNNEvalMs = totalGameMs = 0.0;
+        totalMoves = 0;
+        char jobDone = 1;
+        cout.write(&jobDone, 1);
+        cout.flush();
+        cerr << "daemon: reset done" << endl;
+        continue;
+      }
+
+      vector<ListEntry> jobEntries = parseList(line);
+      if(jobEntries.empty())
+        cerr << "daemon: no entries in job list: " << line << endl;
+      else
+        processEntries(jobEntries);
+
+      char jobDone = 1;
+      cout.write(&jobDone, 1);
+      cout.flush();
+      cerr << "daemon: job done (" << jobEntries.size() << " entries)" << endl;
+    }
+  } else {
+    processEntries(entries);
   }
 
   if(streamMode) {
@@ -794,7 +877,7 @@ int batch_analysis(const vector<string>& args) {
   }
 
   cerr << "\n=== batch-analysis complete ===" << endl;
-  cerr << "  total=" << entries.size()
+  cerr << "  total=" << (success + skipped + failed)
        << "  ok=" << success << "  skipped(<" << minMoves << "mv)=" << skipped
        << "  failed=" << failed << endl;
   cerr << "  format: KAB2  scalarDim=" << SCALAR_DIM

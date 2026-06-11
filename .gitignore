@@ -24,3 +24,12 @@ cpp/KataGoData/
 release/
 
 cpp/analysis_config_opt.cfg
+
+# Experiment / test output directories (local only)
+cpp/test_hs/
+cpp/test_out/
+cpp/test_fix/
+cpp/stress_test/
+cpp/stress_test2/
+cpp/stress_test2.csv
+test_batch/
