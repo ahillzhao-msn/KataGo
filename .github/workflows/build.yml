@@ -1,10 +1,12 @@
-name: Build and Test
+name: Build and Release
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
+    tags:
+      - 'v*'
   pull_request:
-    branches: [ master ]
+    branches: [master]
   workflow_dispatch:
 
 jobs:
@@ -12,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -48,11 +50,11 @@ jobs:
         ./katago runtests
 
     - name: Upload artifact
-      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
       uses: actions/upload-artifact@v4
       with:
         name: katago-linux-opencl
         path: cpp/katago
+        retention-days: 7
 
   build-macos:
     runs-on: macos-latest
@@ -91,11 +93,11 @@ jobs:
         run: |
           ./katago runtests
       - name: Upload artifact
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: actions/upload-artifact@v4
         with:
           name: katago-macos-opencl
           path: cpp/katago
+          retention-days: 7
 
   build-macos-metal:
     runs-on: macos-latest
@@ -110,12 +112,6 @@ jobs:
         run: |
           brew install ninja zlib libzip protobuf abseil
 
-      # The CMake build (build.ninja, CMakeCache.txt) bakes in version-pinned
-      # Homebrew Cellar paths for protobuf/abseil (e.g.
-      # -L/opt/homebrew/Cellar/protobuf/34.1/lib). When Homebrew bumps those
-      # the cached paths go stale and the link fails.
-      # Capture the installed versions into the cache key so
-      # a formula bump invalidates the cache and forces a fresh configure.
       - name: Capture dependency versions for cache key
         id: dep-versions
         run: |
@@ -150,17 +146,17 @@ jobs:
           ./katago runtests
 
       - name: Upload artifact
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: actions/upload-artifact@v4
         with:
           name: katago-macos-metal
           path: cpp/katago
+          retention-days: 7
 
   build-windows:
     runs-on: windows-latest
     permissions:
       contents: read
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -205,9 +201,86 @@ jobs:
       run: |
         Release/katago.exe runtests
 
+    - name: Package Windows release
+      working-directory: cpp
+      run: |
+        Compress-Archive -Path "Release/katago.exe", "Release/*.dll" `
+          -DestinationPath "katago-windows-opencl.zip"
+
     - name: Upload artifact
-      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
       uses: actions/upload-artifact@v4
       with:
         name: katago-windows-opencl
-        path: cpp/Release/
+        path: cpp/katago-windows-opencl.zip
+        retention-days: 7
+
+  # ── Create GitHub Release on tag push ────────────────────────────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos, build-macos-metal, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets/
+
+      - name: Rename binaries for release
+        run: |
+          mkdir -p dist
+          # Linux OpenCL
+          cp release-assets/katago-linux-opencl/katago dist/katago-linux-opencl
+          chmod +x dist/katago-linux-opencl
+          # macOS OpenCL
+          cp release-assets/katago-macos-opencl/katago dist/katago-macos-opencl
+          chmod +x dist/katago-macos-opencl
+          # macOS Metal
+          cp release-assets/katago-macos-metal/katago dist/katago-macos-metal
+          chmod +x dist/katago-macos-metal
+          # Windows (zip already includes DLLs)
+          cp release-assets/katago-windows-opencl/katago-windows-opencl.zip dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: KataGo ${{ github.ref_name }} (KAB2 fork)
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            ## KataGo KAB2 Fork — ${{ github.ref_name }}
+
+            Custom fork of [lightvector/KataGo](https://github.com/lightvector/KataGo)
+            adding `batch_analysis` for KataRank feature extraction.
+
+            ### Downloads
+
+            | Platform | File | Backend |
+            |----------|------|---------|
+            | Windows | `katago-windows-opencl.zip` | OpenCL (GPU + CPU) |
+            | Linux | `katago-linux-opencl` | OpenCL |
+            | macOS | `katago-macos-opencl` | OpenCL |
+            | macOS | `katago-macos-metal` | Metal (Apple Silicon) |
+
+            > **CUDA Windows binary**: Not built in CI (requires CUDA runner).
+            > If you have a CUDA GPU on Windows, use the CUDA build from
+            > local compilation or contact the maintainer for a CUDA binary.
+
+            ### Windows setup
+
+            1. Download `katago-windows-opencl.zip` and extract.
+            2. Download a standard KataGo OpenCL config from
+               [KataGo releases](https://github.com/lightvector/KataGo/releases)
+               or run `katago.exe tuner -model model.bin.gz`.
+            3. Replace the stock `katago.exe` in your KataGo OpenCL installation
+               with this binary, keeping all other files.
+
+            ### Usage
+
+            See [KataRank README](https://github.com/ahillzhao-msn/katarank#readme)
+            for `batch_analysis` usage, KAB2 format, and daemon mode.
