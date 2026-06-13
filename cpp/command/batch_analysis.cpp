@@ -343,10 +343,79 @@ static void appendMoveRecord(
   }
 }
 
-// ─── HumanSL second pass ─────────────────────────────────────────────
+// ─── Shared game replay ──────────────────────────────────────────────
 //
-// Re-replays all moves in the game and queries humanEval with 3 candidate
-// rank profiles for each player.  Updates sb.humanRankIdx / humanLogPrior.
+// Single replay engine with all safety guards: consecutive-color truncation,
+// move limit, null/pass handling, game-finished detection, tolerant board
+// advancement.  Both the main eval pass and HumanSL pass use this, so any
+// new guard added here automatically protects all passes.
+
+struct ReplayPosition {
+  Player pla;
+  int    rowPos;
+  size_t turn;
+};
+
+enum class ReplayAction { CONTINUE, STOP };
+
+template<typename Visitor>
+static bool replayGame(
+  const CompactSgf* sgf, const Rules& rules,
+  int nnXLen, int nnYLen, int maxMoves,
+  Visitor& visitor
+) {
+  Board board;
+  BoardHistory history;
+  Player initialPla;
+  sgf->setupInitialBoardAndHist(rules, board, initialPla, history);
+
+  Player lastStonePla   = P_BLACK;
+  bool   firstStoneSeen = false;
+  int    evaluated       = 0;
+
+  const size_t moveLimit = std::min(sgf->moves.size(), (size_t)maxMoves);
+  for(size_t turn = 0; turn < moveLimit; turn++) {
+    const Move& move = sgf->moves[turn];
+
+    if(move.loc == Board::NULL_LOC) {
+      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+      continue;
+    }
+
+    // Consecutive same-color = end-of-game annotation (Chinese dead-stone
+    // marking, etc.).  Truncate — keep all data collected so far.
+    if(firstStoneSeen && move.pla == lastStonePla) {
+      cerr << "  [replay] consecutive " << (move.pla == P_BLACK ? "B" : "W")
+           << " at turn " << turn << " — truncating." << endl;
+      break;
+    }
+    lastStonePla   = move.pla;
+    firstStoneSeen = true;
+
+    if(history.isGameFinished) {
+      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+      continue;
+    }
+
+    int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
+    if(rowPos < 0 || rowPos >= NNPos::MAX_NN_POLICY_SIZE) {
+      if(!history.makeBoardMoveTolerant(board, move.loc, move.pla))
+        break;
+      continue;
+    }
+
+    ReplayPosition pos{move.pla, rowPos, turn};
+    ReplayAction action = visitor(board, history, pos);
+    if(action == ReplayAction::STOP) break;
+    evaluated++;
+
+    if(!history.makeBoardMoveTolerant(board, move.loc, move.pla))
+      break;
+  }
+  return evaluated > 0;
+}
+
+// ─── HumanSL second pass ─────────────────────────────────────────────
 
 static void runHumanSLPass(
   const CompactSgf* sgf, const Rules& rules,
@@ -355,50 +424,21 @@ static void runHumanSLPass(
   int nnXLen, int nnYLen,
   PlayerSummary& sb, PlayerSummary& sw
 ) {
-  Board board;
-  BoardHistory history;
-  Player initialPla;
-  sgf->setupInitialBoardAndHist(rules, board, initialPla, history);
-
   float sumLogB[HUMAN_CANDIDATES] = {}, sumLogW[HUMAN_CANDIDATES] = {};
   int   cntB  [HUMAN_CANDIDATES] = {}, cntW  [HUMAN_CANDIDATES] = {};
 
-  int evalMoves = 0;
-  bool evalOk   = true;
-
-  for(const Move& move : sgf->moves) {
-    if(!evalOk || evalMoves >= MAX_HUMAN_MOVES) break;
-
-    if(move.loc == Board::NULL_LOC) {
-      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-      continue;
-    }
-
-    // Skip evaluation on finished positions but still advance board state.
-    if(history.isGameFinished) {
-      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-      continue;
-    }
-
-    Player evalPla = move.pla;
-    int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
-
-    // Sanity-check move is within the evaluation grid.
-    if(rowPos < 0 || rowPos >= NNPos::MAX_NN_POLICY_SIZE) {
-      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-      continue;
-    }
-
-    const vector<int>& cand = (evalPla == P_BLACK) ? candB : candW;
-    float* sumLog = (evalPla == P_BLACK) ? sumLogB : sumLogW;
-    int*   cnt    = (evalPla == P_BLACK) ? cntB    : cntW;
+  auto visitor = [&](const Board& board, const BoardHistory& history,
+                     const ReplayPosition& pos) -> ReplayAction {
+    const vector<int>& cand = (pos.pla == P_BLACK) ? candB : candW;
+    float* sumLog = (pos.pla == P_BLACK) ? sumLogB : sumLogW;
+    int*   cnt    = (pos.pla == P_BLACK) ? cntB    : cntW;
 
     for(int k = 0; k < HUMAN_CANDIDATES; k++) {
       SGFMetadata meta = SGFMetadata::getProfile(RANK_PROFILES[cand[k]]);
 
       NNResultBuf hbuf;
       hbuf.result = std::make_shared<NNOutput>();
-      hbuf.result->includeTrunk = false;  // policy head only for HumanSL
+      hbuf.result->includeTrunk = false;
       hbuf.result->includePick  = false;
 
       MiscNNInputParams hparams;
@@ -406,28 +446,24 @@ static void runHumanSLPass(
       hparams.policyOptimism = 0.0;
 
       try {
-        humanEval->evaluate(board, history, evalPla, &meta, hparams, hbuf, true, false);
+        humanEval->evaluate(board, history, pos.pla, &meta, hparams, hbuf, true, false);
       } catch(const exception& e) {
-        cerr << "HumanSL evaluate exception at move " << evalMoves
-             << " candidate " << k << ": " << e.what() << " — aborting HumanSL pass." << endl;
-        evalOk = false;
-        break;
+        cerr << "HumanSL evaluate exception at turn " << pos.turn
+             << " candidate " << k << ": " << e.what() << endl;
+        return ReplayAction::STOP;
       }
 
       if(hbuf.result) {
-        float prob = hbuf.result->policyProbs[rowPos];
+        float prob = hbuf.result->policyProbs[pos.rowPos];
         sumLog[k] += std::log(std::max(prob, 1e-10f));
         cnt[k]++;
       }
     }
+    return ReplayAction::CONTINUE;
+  };
 
-    if(!evalOk) break;
-    history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-    evalMoves++;
-  }
+  replayGame(sgf, rules, nnXLen, nnYLen, MAX_HUMAN_MOVES, visitor);
 
-  // Pick best candidate for each player; {-1, 0} if nothing was evaluated
-  // (e.g. exception on the very first move) so humanRankIdx stays unset.
   auto selectBest = [](const float sl[], const int ct[],
                        const vector<int>& cand) -> pair<int,float> {
     int   bestK    = -1;
@@ -524,7 +560,9 @@ int batch_analysis(const vector<string>& args) {
 
   Logger logger;
   Rand seedRand;
-  ConfigParser cfg = configFile.empty() ? ConfigParser() : ConfigParser(configFile);
+  ConfigParser cfg;
+  if(!configFile.empty())
+    cfg.initialize(configFile);
   Setup::initializeSession(cfg);
   Board::initHash();
 
@@ -592,21 +630,9 @@ int batch_analysis(const vector<string>& args) {
       auto sgf = CompactSgf::loadFile(entry.sgfPath);
       if(!sgf) { failed++; continue; }
 
-      auto& moves = sgf->moves;
-      if((int)moves.size() < minMoves) { skipped++; continue; }
-
-      // Truncate runaway games from corrupted SGFs.
-      const size_t moveLimit = (moves.size() > (size_t)MAX_GAME_MOVES)
-                               ? (size_t)MAX_GAME_MOVES : moves.size();
-      if(moves.size() > (size_t)MAX_GAME_MOVES)
-        cerr << "Warning: game " << gi << " has " << moves.size()
-             << " moves; truncating to " << MAX_GAME_MOVES << endl;
+      if((int)sgf->moves.size() < minMoves) { skipped++; continue; }
 
       Rules rules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
-      Board board;
-      BoardHistory history;
-      Player initialPla;
-      sgf->setupInitialBoardAndHist(rules, board, initialPla, history);
 
       vector<float> data_B, data_W;
       data_B.reserve(80 * moveDim);
@@ -622,112 +648,76 @@ int batch_analysis(const vector<string>& args) {
       int            prevRecordIdx  = -1;
       Player         prevPla        = P_BLACK;
 
-      // Alternation tracking: consecutive same-color stone → truncate, not reject.
-      Player lastStonePla    = P_BLACK;
-      bool   firstStoneSeen  = false;
-
-      bool gameEvalOk = true;
-      for(size_t turn = 0; turn < moveLimit; turn++) {
-        if(!gameEvalOk) break;
-        const Move& move = moves[turn];
-        if(move.loc == Board::NULL_LOC) {
-          history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-          continue;
-        }
-
-        // Consecutive same-color stone placement = game effectively ended; keep data so far.
-        if(firstStoneSeen && move.pla == lastStonePla) {
-          cerr << "  Game " << gi << " (" << entry.sgfPath << "): consecutive "
-               << (move.pla == P_BLACK ? "B" : "W") << " at turn " << turn
-               << " — truncating." << endl;
-          break;
-        }
-        lastStonePla   = move.pla;
-        firstStoneSeen = true;
-
-        // Skip evaluation on finished positions.
-        if(history.isGameFinished) {
-          history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-          continue;
-        }
-
-        Player evalPla = move.pla;
-        int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
-
+      auto mainVisitor = [&](const Board& board, const BoardHistory& history,
+                             const ReplayPosition& pos) -> ReplayAction {
         NNResultBuf nnbuf;
         nnbuf.result = std::make_shared<NNOutput>();
-        nnbuf.result->includeTrunk = !noTrunk;  // skip trunk in lite mode
-        nnbuf.result->includePick  = false;  // we extract pick from trunk directly
+        nnbuf.result->includeTrunk = !noTrunk;
+        nnbuf.result->includePick  = false;
 
         MiscNNInputParams params;
         params.symmetry = 0;
         params.policyOptimism = 0.0;
         try {
           Clock::time_point t0 = Clock::now();
-          nnEval->evaluate(board, history, evalPla, params, nnbuf, true, false);
-          Clock::time_point t1 = Clock::now();
-          double evalMs = chrono::duration<double, milli>(t1 - t0).count();
-          gameNNEvalMs += evalMs;
+          nnEval->evaluate(board, history, pos.pla, params, nnbuf, true, false);
+          gameNNEvalMs += chrono::duration<double, milli>(Clock::now() - t0).count();
         } catch(const exception& e) {
-          cerr << "Evaluate exception at game " << gi << " move " << turn
-               << ": " << e.what() << " — skipping rest of game." << endl;
-          gameEvalOk = false;
-          break;
+          cerr << "Evaluate exception at game " << gi << " turn " << pos.turn
+               << ": " << e.what() << endl;
+          return ReplayAction::STOP;
         }
         NNOutput* output = nnbuf.result.get();
+        if(!output) return ReplayAction::CONTINUE;
 
-        if(output) {
-          // ── 1. Fill deferred delta into previous record ──────────────────
-          if(hasPrevEval && prevBuf && prevRecordIdx >= 0) {
-            float wD = output->whiteWinProb   - prevWinProb;
-            float sD = output->whiteScoreMean - prevScoreMean;
-            int base_ = prevRecordIdx * moveDim;
-            (*prevBuf)[base_ + 8] = wD;
-            (*prevBuf)[base_ + 9] = sD / 50.0f;
-            float pWD = (prevPla == P_BLACK) ? -wD :  wD;
-            float pSD = (prevPla == P_BLACK) ? -sD :  sD;
-            ((prevPla == P_BLACK) ? accB : accW).addDelta(pWD, pSD);
-          }
-
-          // ── 2. Move-level stats (computed once, shared by acc + record) ──
-          float policyPrior = (rowPos >= 0 && rowPos < NNPos::MAX_NN_POLICY_SIZE)
-                              ? output->policyProbs[rowPos] : 0.0f;
-          int rank = 0;
-          for(int i = 0; i < NNPos::MAX_NN_POLICY_SIZE; i++)
-            if(output->policyProbs[i] > policyPrior) rank++;
-
-          float playerWinRate   = (evalPla == P_BLACK)
-                                  ? 1.0f - output->whiteWinProb
-                                  : output->whiteWinProb;
-          float playerScoreLead = (evalPla == P_BLACK)
-                                  ? -output->whiteScoreMean
-                                  :  output->whiteScoreMean;
-
-          // ── 3. Update accumulator ─────────────────────────────────────────
-          ((evalPla == P_BLACK) ? accB : accW).addMove(
-            rank, policyPrior, playerWinRate, playerScoreLead,
-            output->shorttermScoreError
-          );
-
-          // ── 4. Append record (delta slots pre-zeroed, filled above) ──────
-          int curIdx = (evalPla == P_BLACK) ? nBlack : nWhite;
-          auto& dataBuf = (evalPla == P_BLACK) ? data_B : data_W;
-          appendMoveRecord(dataBuf, output, evalPla, policyPrior, rank, rowPos,
-                           trunkCh, nnXLen, nnYLen);
-
-          // ── 5. Advance deferred-delta tracking ───────────────────────────
-          prevWinProb   = output->whiteWinProb;
-          prevScoreMean = output->whiteScoreMean;
-          hasPrevEval   = true;
-          prevBuf       = &dataBuf;
-          prevRecordIdx = curIdx;
-          prevPla       = evalPla;
-
-          if(evalPla == P_BLACK) nBlack++; else nWhite++;
+        // ── 1. Deferred delta fill ──────────────────────────────────────
+        if(hasPrevEval && prevBuf && prevRecordIdx >= 0) {
+          float wD = output->whiteWinProb   - prevWinProb;
+          float sD = output->whiteScoreMean - prevScoreMean;
+          int base_ = prevRecordIdx * moveDim;
+          (*prevBuf)[base_ + 8] = wD;
+          (*prevBuf)[base_ + 9] = sD / 50.0f;
+          float pWD = (prevPla == P_BLACK) ? -wD :  wD;
+          float pSD = (prevPla == P_BLACK) ? -sD :  sD;
+          ((prevPla == P_BLACK) ? accB : accW).addDelta(pWD, pSD);
         }
 
-        history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-      }
+        // ── 2. Move-level stats ─────────────────────────────────────────
+        float policyPrior = output->policyProbs[pos.rowPos];
+        int rank = 0;
+        for(int i = 0; i < NNPos::MAX_NN_POLICY_SIZE; i++)
+          if(output->policyProbs[i] > policyPrior) rank++;
+
+        float playerWinRate   = (pos.pla == P_BLACK)
+                                ? 1.0f - output->whiteWinProb : output->whiteWinProb;
+        float playerScoreLead = (pos.pla == P_BLACK)
+                                ? -output->whiteScoreMean : output->whiteScoreMean;
+
+        // ── 3. Update accumulator ───────────────────────────────────────
+        ((pos.pla == P_BLACK) ? accB : accW).addMove(
+          rank, policyPrior, playerWinRate, playerScoreLead,
+          output->shorttermScoreError
+        );
+
+        // ── 4. Append feature record ────────────────────────────────────
+        int curIdx = (pos.pla == P_BLACK) ? nBlack : nWhite;
+        auto& dataBuf = (pos.pla == P_BLACK) ? data_B : data_W;
+        appendMoveRecord(dataBuf, output, pos.pla, policyPrior, rank, pos.rowPos,
+                         trunkCh, nnXLen, nnYLen);
+
+        // ── 5. Advance deferred-delta tracking ──────────────────────────
+        prevWinProb   = output->whiteWinProb;
+        prevScoreMean = output->whiteScoreMean;
+        hasPrevEval   = true;
+        prevBuf       = &dataBuf;
+        prevRecordIdx = curIdx;
+        prevPla       = pos.pla;
+
+        if(pos.pla == P_BLACK) nBlack++; else nWhite++;
+        return ReplayAction::CONTINUE;
+      };
+
+      replayGame(sgf.get(), rules, nnXLen, nnYLen, MAX_GAME_MOVES, mainVisitor);
 
       // ── PlayerSummary from first pass ────────────────────────────────────
       PlayerSummary sb = accB.toSummary();
@@ -802,7 +792,7 @@ int batch_analysis(const vector<string>& args) {
         if(meta)
           meta << base << "," << entry.playerBlack << "," << entry.playerWhite << ","
                << entry.blackElo << "," << entry.whiteElo << ","
-               << moves.size() << "," << nBlack << "," << nWhite << "," << entry.set << ","
+               << sgf->moves.size() << "," << nBlack << "," << nWhite << "," << entry.set << ","
                << sb.accuracy1 << "," << sb.accuracy3 << "," << sb.meanLogPrior << ","
                << sb.meanWinRate << "," << sb.meanScoreLead << "," << sb.meanComplexity << ","
                << sb.scoreVariance << "," << sb.approxScoreDrop << ","
@@ -817,6 +807,9 @@ int batch_analysis(const vector<string>& args) {
       success++;
     } catch(const exception& e) {
       cerr << "Error on game " << gi << " (" << entry.sgfPath << "): " << e.what() << endl;
+      failed++;
+    } catch(...) {
+      cerr << "Unknown error on game " << gi << " (" << entry.sgfPath << ") — skipping." << endl;
       failed++;
     }
 
