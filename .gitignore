@@ -33,3 +33,12 @@ cpp/stress_test/
 cpp/stress_test2/
 cpp/stress_test2.csv
 test_batch/
+
+# Build artifacts
+cpp/build/
+cpp/katago.exe
+cpp/*.vcxproj
+cpp/*.vcxproj.filters
+cpp/*.sln
+cpp/external/zlib-src/
+cpp/external/zlib/
