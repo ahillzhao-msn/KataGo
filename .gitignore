@@ -33,3 +33,4 @@ cpp/stress_test/
 cpp/stress_test2/
 cpp/stress_test2.csv
 test_batch/
+__pycache__/

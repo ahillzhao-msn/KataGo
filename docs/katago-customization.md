@@ -1,10 +1,44 @@
-# KataGo Trunk Feature Extraction — Customization Guide
+# KataGo — Trunk Feature Extraction Fork — Customization Guide
 
-This document describes the customizations made to vanilla [lightvector/KataGo](https://github.com/lightvector/KataGo) for trunk feature extraction. Total intrusion: **28 lines across 5 files**.
+This document describes the customizations applied on top of vanilla [lightvector/KataGo](https://github.com/lightvector/KataGo) upstream `master` branch.
 
 ## What Was Added
 
-### 1. Trunk/Pick Output in NNOutput (`nninputs.h`, +4 lines)
+### 1. `batch_analysis` Command (`command/batch_analysis.cpp`, new)
+
+A self-contained module (~890 lines) that provides batch SGF analysis with trunk feature extraction:
+
+- Accepts `-list games.csv` or multiple CSV paths
+- For each SGF: loads game, extracts main line, skips < 10 moves
+- For each position: evaluates with NNEvaluator, collects head(12)+trunk(256)+pick(256) features
+- Writes per-player KAB2-formatted NPZ binary output (zlib-compressed)
+- Handles errors per-file and continues
+
+### 2. Stream Mode (`-stream`, `-no-trunk`)
+
+Pipes KAB2 frames to stdout (zero disk I/O):
+
+- Protocol: `[1B 'B'/'W'][4B idLen][game id][4B size][KAB2 payload]`
+- Terminated by `0x01` (task complete) and `0x00` (process end)
+- Lite mode (`-no-trunk`): scalars only (10 floats/move), 100x smaller
+
+### 3. Daemon Mode (`-daemon`)
+
+Model-resident persistent process:
+
+- stdin interface: one games.csv path per line
+- `reset` clears batch cache; `quit` exits
+- Task latency drops from ~10s+ cold start to analysis-only time
+
+### 4. HumanSL Rank Assessment (`-human-model <model>`)
+
+Optional second pass with a human-style model:
+
+- Annotates player rank (20k–9d) with confidence
+- Each rank scored: confidence = softmax(log-probs / temperature)
+- Stored in PlayerSummary header of KAB2 format
+
+### 5. Trunk/Pick Output in NNOutput
 
 ```cpp
 bool includeTrunk = false;    // request trunk features from backend
@@ -13,75 +47,43 @@ float* trunk = NULL;          // trunk: trunkNumChannels × nnXLen × nnYLen
 float* pick = NULL;           // pick: trunkNumChannels (at move position)
 ```
 
-These fields are initialized to `false`/`NULL` — the neural net backend will only compute trunk if explicitly requested, so there is zero performance impact on normal Katago usage.
+Zero performance impact when disabled (default).
 
-### 2. OpenCL Trunk Buffer Read (`openclbackend.cpp`, +20 lines)
-
-In `NeuralNet::getOutput()`, after the GPU forward pass:
-
-- `InputBuffers` gains a `trunkResults` host buffer
-- After policy/value results are read from GPU, a `clEnqueueReadBuffer` copies `buffers->trunk` to host
-- In the batch loop, trunk is copied to `output->trunk`/`output->pick` with symmetry correction
-
-Other backends (CUDA, Eigen) follow the same pattern but weren't modified since OpenCL is the target deployment backend.
-
-### 3. `batch_analysis` Command (`command/batch_analysis.cpp`, new file)
-
-A self-contained module (356 lines) that:
-
-- Accepts `-list games.csv` or `-sgf-dir ./sgfs/`
-- For each SGF: loads game, extracts main line, skips < 10 moves
-- For each position: evaluates with NNEvaluator, collects head(12)+trunk(256)+pick(256) features
-- Writes per-player NPZ binary output
-- Handles errors per-file and continues
-
-### 4. Command Registration (`main.h/cpp`, +3 lines)
+### 6. Command Registration
 
 - `int batch_analysis(const std::vector<std::string>& subArgs);` in `MainCmds` namespace
 - Registered in `main.cpp` with help text and command handler
+- `-batch-size` CLI parameter for NNEvaluator max batch control
+- `-profile` hidden flag for per-game timing breakdown
 
-### 5. CMakeLists.txt (+1 line)
+## KAB2 Format
 
-Added `command/batch_analysis.cpp` to the `COMMAND_SOURCES` list.
+Combined+zlib NPZ: `[4B B payload][B KAB2][4B W payload][W KAB2]`
 
-## Upgrade Strategy
+96-byte header (PlayerSummary) + per-move: scalars(10) + pick(C) + avgTrunk(C) float32.
 
-When upgrading to a newer KataGo version:
+## Files Changed
 
-```
-1. Copy these 4 files from old fork to new:
-   ├── neuralnet/nninputs.h        [+4 lines] — trunk/pick fields
-   ├── neuralnet/openclbackend.cpp [+20 lines] — trunk buffer read
-   ├── command/batch_analysis.cpp     [new file] — the module
-   └── CMakeLists.txt              [+1 line] — add to build
+| File | Change |
+|------|--------|
+| `command/batch_analysis.cpp` | New file (~890 lines) |
+| `command/batch_analysis.h` | New header |
+| `main.cpp` | +9 lines (command registration) |
+| `main.h` | +3 lines (function declaration) |
+| `neuralnet/nninputs.cpp` | +14 lines (trunk/pick fields) |
+| `neuralnet/nninputs.h` | +4 lines (flags and pointers) |
+| `neuralnet/nneval.cpp` | +3 lines (trunk channel count) |
+| `neuralnet/nneval.h` | +1 line (trunk channels constant) |
+| `neuralnet/openclbackend.cpp` | +37 lines (GPU trunk buffer read) |
+| `search/search.cpp` | +13 lines / -8 lines (minor) |
+| `strmodel/*` | Strength model evaluation modules |
 
-2. Update main.h and main.cpp:
-   ├── main.h   [+1 line]  — add function declaration
-   └── main.cpp [+2 lines] — add help text + command handler
-```
+## Upgrade Notes
 
-The total merge effort is **~30 lines**. Conflicts are unlikely because:
-- `nninputs.h` additions are at the end of the struct, near other bool fields
-- `openclbackend.cpp` additions are in the batch loop, a stable function
-- `batch_analysis.cpp` is a self-contained new file
-- `main.h/cpp` additions are at the end of existing lists
+This fork is rebased directly on upstream `master`. To upgrade to a future upstream release:
 
-## Output Format
+1. Fetch upstream: `git fetch upstream`
+2. Rebase onto new upstream/master: `git rebase upstream/master`
+3. Resolve any conflicts in the files listed above
 
-### NPZ Binary
-
-```
-Header:  [KABN][num_moves:4][12:4][256:4][256:4]
-Per move: head[12] + trunk[256] + pick[256] = 2096 bytes
-```
-
-### CSV Metadata
-
-`_meta.csv` accompanies each batch run with game-level metadata.
-
-## References
-
-- Original KataGo: [lightvector/KataGo](https://github.com/lightvector/KataGo)
-- Strength model concept: [Animiral/go-strength-model](https://github.com/Animiral/go-strength-model)
-- Preprocessing patterns: [ahillzhao-msn/go-analyzer](https://github.com/ahillzhao-msn/go-analyzer)
-- This fork: [ahillzhao-msn/KataGo](https://github.com/ahillzhao-msn/KataGo)
+The customizations are intentionally minimal and isolated to make this process smooth.
