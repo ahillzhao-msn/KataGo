@@ -3911,7 +3911,8 @@ struct InputBuffers {
     policyResultsHalf = new half_t[(size_t)maxBatchSize * m.numPolicyChannels * maxPaddedNNXYLen];
     valueResults = new float[(size_t)maxBatchSize * m.numValueChannels];
     trunkResults     = new float [(size_t)maxBatchSize * m.trunk.trunkNumChannels * nnXLen * nnYLen];
-    trunkResultsHalf = new half_t[(size_t)maxBatchSize * m.trunk.trunkNumChannels * nnXLen * nnYLen];
+    // GPU trunk layout is [batch][C][paddedNNXYLen]; the half staging buffer holds it padded
+    trunkResultsHalf = new half_t[(size_t)maxBatchSize * m.trunk.trunkNumChannels * maxPaddedNNXYLen];
 
     scoreValueResults = new float[(size_t)maxBatchSize * m.numScoreValueChannels];
     ownershipResults = new float[(size_t)maxBatchSize * nnXLen * nnYLen * m.numOwnershipChannels];
@@ -4168,22 +4169,27 @@ void NeuralNet::getOutput(
   for(int row = 0; row < batchSize; row++)
     anyTrunk = anyTrunk || outputs[row]->includeTrunk;
   if(anyTrunk && inputBuffers->trunkResults != NULL) {
-    int trunkCh = gpuHandle->model->trunk->trunkNumChannels;
-    size_t trunkElts = (size_t)trunkCh * nnXLen * nnYLen * batchSize;
+    // The GPU buffer is [batch][C][paddedNNXYLen] (padded when FP16 tensor cores are
+    // used); trunkResults is unpadded [batch][C][nnXYLen].
+    size_t trunkPlanes = (size_t)gpuHandle->model->trunk->trunkNumChannels * batchSize;
+    size_t paddedTrunkElts = trunkPlanes * paddedNNXYLen;
     if(useFP16Storage) {
       err = clEnqueueReadBuffer(
         handle->commandQueue, gpuHandle->buffers->trunk, blocking, 0,
-        trunkElts * sizeof(half_t), inputBuffers->trunkResultsHalf, 0, NULL, NULL
+        paddedTrunkElts * sizeof(half_t), inputBuffers->trunkResultsHalf, 0, NULL, NULL
       );
       CHECK_ERR(err);
-      for(size_t i = 0; i < trunkElts; i++)
-        inputBuffers->trunkResults[i] = (float)inputBuffers->trunkResultsHalf[i];
-    } else {
+      for(size_t c = 0; c < trunkPlanes; c++)
+        for(int xy = 0; xy < nnXYLen; xy++)
+          inputBuffers->trunkResults[c * nnXYLen + xy] = (float)inputBuffers->trunkResultsHalf[c * paddedNNXYLen + xy];
+    } else if(paddedNNXYLen == nnXYLen) {
       err = clEnqueueReadBuffer(
         handle->commandQueue, gpuHandle->buffers->trunk, blocking, 0,
-        trunkElts * sizeof(float), inputBuffers->trunkResults, 0, NULL, NULL
+        paddedTrunkElts * sizeof(float), inputBuffers->trunkResults, 0, NULL, NULL
       );
       CHECK_ERR(err);
+    } else {
+      ASSERT_UNREACHABLE;
     }
   }
 
