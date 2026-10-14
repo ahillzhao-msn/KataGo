@@ -437,9 +437,7 @@ static void runHumanSLPass(
       SGFMetadata meta = SGFMetadata::getProfile(RANK_PROFILES[cand[k]]);
 
       NNResultBuf hbuf;
-      hbuf.result = std::make_shared<NNOutput>();
-      hbuf.result->includeTrunk = false;
-      hbuf.result->includePick  = false;
+      hbuf.includeTrunk = false;
 
       MiscNNInputParams hparams;
       hparams.symmetry = 0;
@@ -651,9 +649,7 @@ int batch_analysis(const vector<string>& args) {
       auto mainVisitor = [&](const Board& board, const BoardHistory& history,
                              const ReplayPosition& pos) -> ReplayAction {
         NNResultBuf nnbuf;
-        nnbuf.result = std::make_shared<NNOutput>();
-        nnbuf.result->includeTrunk = !noTrunk;
-        nnbuf.result->includePick  = false;
+        nnbuf.includeTrunk = !noTrunk;
 
         MiscNNInputParams params;
         params.symmetry = 0;

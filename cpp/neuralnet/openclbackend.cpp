@@ -4163,8 +4163,11 @@ void NeuralNet::getOutput(
   );
   CHECK_ERR(err);
 
-  // Read trunk buffer from GPU; handle FP16→FP32 conversion when needed
-  if(inputBuffers->trunkResults != NULL) {
+  // Read trunk buffer from GPU only when some row asked for it; handle FP16→FP32 conversion
+  bool anyTrunk = false;
+  for(int row = 0; row < batchSize; row++)
+    anyTrunk = anyTrunk || outputs[row]->includeTrunk;
+  if(anyTrunk && inputBuffers->trunkResults != NULL) {
     int trunkCh = gpuHandle->model->trunk->trunkNumChannels;
     size_t trunkElts = (size_t)trunkCh * nnXLen * nnYLen * batchSize;
     if(useFP16Storage) {
