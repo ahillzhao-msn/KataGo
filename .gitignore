@@ -42,3 +42,4 @@ cpp/*.vcxproj.filters
 cpp/*.sln
 cpp/external/zlib-src/
 cpp/external/zlib/
+__pycache__/
