@@ -67,7 +67,6 @@ using namespace std;
 namespace MainCmds {
 
 static const int SCALAR_DIM       = 10;
-static const int HUMAN_CANDIDATES = 3;   // rank profiles tested per player per game
 static const int MAX_GAME_MOVES   = 800; // truncate games longer than this (corrupted SGF guard)
 static const int MAX_HUMAN_MOVES  = 400; // cap HumanSL pass moves to prevent runaway
 
@@ -87,13 +86,63 @@ static string rankIdxToStr(float idx) {
   return RANK_PROFILES[i];
 }
 
-// Map meanLogPrior → 3 neighbouring candidate rank indices.
-// Empirical range: -5.9 (20k, idx=0) to -0.5 (9d, idx=28).
-// More negative logPrior = weaker player = lower idx.
-static vector<int> rankCandidates(float logPrior) {
-  float t = std::max(0.0f, std::min(1.0f, (logPrior + 5.9f) / 5.4f));
-  int mid = std::min(27, std::max(1, (int)(t * 28.0f + 0.5f)));
-  return {mid - 1, mid, mid + 1};
+// ─── HumanSL rank anchor: coarse + refine scan ────────────────────────
+//
+// The anchor is a fixed procedure, identical for every player and game:
+//   1. gate: the main model scores every move; per player, only moves whose point loss
+//      lies inside that player's 10–90% quantile band for the game vote (see
+//      humanVotingMoves) — the main model is the shared yardstick, HumanSL the ruler;
+//   2. total HumanSL log-likelihood of the voting moves under 5 fixed profiles;
+//   3. a natural cubic spline over those totals gives a posterior over all 29 profiles
+//      (flat prior);
+//   4. label = posterior mean rank (continuous), with posterior sd as its spread.
+// Work ≈ 14% of an all-moves x 29-profile scan. On 160 players (80 games) its split-half
+// stability matched the full scan's (r 0.78 vs 0.78, bootstrap se 0.04); 4 profiles was
+// the measured floor, 3 profiles collapsed (r 0.70).
+static const int HUMAN_PROFILES[] = {0, 7, 14, 21, 28};  // 20k, 13k, 6k, 2d, 9d
+static const double HUMAN_LOSS_BAND_LO = 0.10;   // see humanVotingMoves
+static const double HUMAN_LOSS_BAND_HI = 0.90;
+static const float HUMAN_ANCHOR_VERSION = 2.0f;  // 1 = legacy 3-profile window
+
+// Natural cubic spline through (xs[i], ys[i]) (xs strictly increasing), evaluated at
+// each integer profile index 0..NUM_RANK_PROFILES-1.
+static vector<double> splineAtProfiles(const vector<int>& xs, const vector<double>& ys) {
+  int n = (int)xs.size();
+  vector<double> m(n, 0.0);  // second derivatives; natural: m[0] = m[n-1] = 0
+  if(n >= 3) {
+    vector<double> c(n, 0.0), d(n, 0.0);
+    for(int i = 1; i < n - 1; i++) {
+      double h0 = xs[i] - xs[i - 1], h1 = xs[i + 1] - xs[i];
+      double a = h0, b = 2.0 * (h0 + h1), cc = h1;
+      double r = 6.0 * ((ys[i + 1] - ys[i]) / h1 - (ys[i] - ys[i - 1]) / h0);
+      double den = b - a * c[i - 1];
+      c[i] = cc / den;
+      d[i] = (r - a * d[i - 1]) / den;
+    }
+    for(int i = n - 2; i >= 1; i--) m[i] = d[i] - c[i] * m[i + 1];
+  }
+  vector<double> out(NUM_RANK_PROFILES);
+  int seg = 0;
+  for(int x = 0; x < NUM_RANK_PROFILES; x++) {
+    while(seg < n - 2 && x > xs[seg + 1]) seg++;
+    double h = xs[seg + 1] - xs[seg];
+    double t1 = xs[seg + 1] - x, t0 = x - xs[seg];
+    out[x] = m[seg] * t1 * t1 * t1 / (6 * h) + m[seg + 1] * t0 * t0 * t0 / (6 * h)
+           + (ys[seg] / h - m[seg] * h / 6) * t1 + (ys[seg + 1] / h - m[seg + 1] * h / 6) * t0;
+  }
+  return out;
+}
+
+// Posterior (flat prior) over profiles from per-profile total log-likelihoods.
+static void posteriorMeanSd(const vector<double>& tot, double& mean, double& sd) {
+  double mx = *std::max_element(tot.begin(), tot.end());
+  double z = 0, s1 = 0, s2 = 0;
+  for(int i = 0; i < (int)tot.size(); i++) {
+    double w = std::exp(tot[i] - mx);
+    z += w; s1 += w * i; s2 += w * i * i;
+  }
+  mean = s1 / z;
+  sd = std::sqrt(std::max(0.0, s2 / z - mean * mean));
 }
 
 // ─── Per-player aggregate statistics (embedded in NPZHeader) ──────────
@@ -109,9 +158,12 @@ struct PlayerSummary {
   float approxScoreDrop;  // mean max(0, -playerWinDelta) — mistake proxy
   float meanWinDelta;     // mean signed win delta (player's perspective)
   float meanScoreDelta;   // mean signed score delta (player's perspective)
-  float humanRankIdx;     // best HumanSL rank index (0=20k…28=9d), -1 if not used
-  float humanLogPrior;    // meanLogPrior under best HumanSL profile
-  float reserved[4];      // pad to 16 floats = 64 bytes
+  float humanRankIdx;     // HumanSL anchor rank, rounded (0=20k…28=9d), -1 if not used
+  float humanLogPrior;    // mean HumanSL log-likelihood under the best evaluated profile
+  float humanRankExp;     // HumanSL anchor rank, continuous posterior mean (0..28)
+  float humanRankSd;      // posterior sd of the anchor (ranks)
+  float humanProfiles;    // number of profiles evaluated for this player
+  float humanAnchorVer;   // anchor method version (HUMAN_ANCHOR_VERSION); 0 = absent
 };
 
 #pragma pack(push, 1)
@@ -470,28 +522,31 @@ static void parallelFor(int n, int numThreads, Fn&& fn) {
 
 // ─── HumanSL second pass ─────────────────────────────────────────────
 
-static void runHumanSLPass(
-  const vector<PositionSnap>& snaps,
+// Total HumanSL log-likelihood of each side's moves under the requested profiles.
+// sel: snapshot indices to include (ascending). profB/profW: profile indices to
+// evaluate for Black's / White's moves. Returns false (after logging) if any
+// evaluation threw.
+static bool humanLogLik(
+  const vector<PositionSnap>& snaps, const vector<int>& sel,
   NNEvaluator* humanEval,
-  const vector<int>& candB, const vector<int>& candW,
+  const vector<int>& profB, const vector<int>& profW,
   int numThreads,
-  PlayerSummary& sb, PlayerSummary& sw
+  vector<double>& totB, vector<double>& totW, int& cntB, int& cntW
 ) {
-  float sumLogB[HUMAN_CANDIDATES] = {}, sumLogW[HUMAN_CANDIDATES] = {};
-  int   cntB  [HUMAN_CANDIDATES] = {}, cntW  [HUMAN_CANDIDATES] = {};
-
-  // The HumanSL pass only looks at the first MAX_HUMAN_MOVES turns.
-  int nPos = 0;
-  while(nPos < (int)snaps.size() && snaps[nPos].pos.turn < (size_t)MAX_HUMAN_MOVES) nPos++;
+  // Work items: (position, k-th profile of that position's side), flattened.
+  const int nPos = (int)sel.size();
+  vector<size_t> start(nPos + 1, 0);
+  for(int i = 0; i < nPos; i++)
+    start[i + 1] = start[i] + ((snaps[sel[i]].pos.pla == P_BLACK) ? profB.size() : profW.size());
 
   struct HumanEval { float prob = 0.0f; bool hasResult = false; string error; };
-  vector<HumanEval> evals((size_t)nPos * HUMAN_CANDIDATES);
+  vector<HumanEval> evals(start[nPos]);
 
   parallelFor((int)evals.size(), numThreads, [&](int idx) {
-    const PositionSnap& snap = snaps[idx / HUMAN_CANDIDATES];
-    int k = idx % HUMAN_CANDIDATES;
-    const vector<int>& cand = (snap.pos.pla == P_BLACK) ? candB : candW;
-    SGFMetadata meta = SGFMetadata::getProfile(RANK_PROFILES[cand[k]]);
+    int i = (int)(std::upper_bound(start.begin(), start.end(), (size_t)idx) - start.begin()) - 1;
+    const PositionSnap& snap = snaps[sel[i]];
+    const vector<int>& prof = (snap.pos.pla == P_BLACK) ? profB : profW;
+    SGFMetadata meta = SGFMetadata::getProfile(RANK_PROFILES[prof[idx - start[i]]]);
 
     NNResultBuf hbuf;
     hbuf.includeTrunk = false;
@@ -513,47 +568,90 @@ static void runHumanSLPass(
     }
   });
 
-  bool stopped = false;
-  for(int i = 0; i < nPos && !stopped; i++) {
-    const ReplayPosition& pos = snaps[i].pos;
-    float* sumLog = (pos.pla == P_BLACK) ? sumLogB : sumLogW;
-    int*   cnt    = (pos.pla == P_BLACK) ? cntB    : cntW;
-    for(int k = 0; k < HUMAN_CANDIDATES; k++) {
-      const HumanEval& ev = evals[(size_t)i * HUMAN_CANDIDATES + k];
+  totB.assign(profB.size(), 0.0);
+  totW.assign(profW.size(), 0.0);
+  cntB = cntW = 0;
+  // Sum in move order so the result does not depend on thread scheduling.
+  for(int i = 0; i < nPos; i++) {
+    bool black = snaps[sel[i]].pos.pla == P_BLACK;
+    vector<double>& tot = black ? totB : totW;
+    bool any = false;
+    for(size_t k = 0; k < tot.size(); k++) {
+      const HumanEval& ev = evals[start[i] + k];
       if(!ev.error.empty()) {
-        cerr << "HumanSL evaluate exception at turn " << pos.turn
-             << " candidate " << k << ": " << ev.error << endl;
-        stopped = true;
-        break;
+        cerr << "HumanSL evaluate exception at turn " << snaps[sel[i]].pos.turn
+             << " profile " << (black ? profB : profW)[k] << ": " << ev.error << endl;
+        return false;
       }
-      if(ev.hasResult) {
-        sumLog[k] += std::log(std::max(ev.prob, 1e-10f));
-        cnt[k]++;
-      }
+      if(!ev.hasResult) continue;
+      tot[k] += std::log(std::max((double)ev.prob, 1e-10));
+      any = true;
     }
+    if(any) (black ? cntB : cntW)++;
   }
+  return true;
+}
 
-  auto selectBest = [](const float sl[], const int ct[],
-                       const vector<int>& cand) -> pair<int,float> {
-    int   bestK    = -1;
-    float bestMean = -1e20f;
-    for(int k = 0; k < HUMAN_CANDIDATES; k++) {
-      if(ct[k] > 0) {
-        float m = sl[k] / ct[k];
-        if(m > bestMean) { bestMean = m; bestK = k; }
-      }
-    }
-    if(bestK < 0) return {-1, 0.0f};
-    return {cand[bestK], bestMean};
+// Linear-interpolated quantile of v (numpy's default method). v non-empty.
+static float quantileLinear(vector<float> v, double q) {
+  std::sort(v.begin(), v.end());
+  double h = (v.size() - 1) * q;
+  size_t lo = (size_t)std::floor(h);
+  if(lo + 1 >= v.size()) return v.back();
+  return (float)(v[lo] + (h - lo) * (v[lo + 1] - v[lo]));
+}
+
+// Moves that vote in the HumanSL anchor: within the first MAX_HUMAN_MOVES turns, and,
+// per side, whose main-model point loss lies inside that player's
+// [HUMAN_LOSS_BAND_LO, HUMAN_LOSS_BAND_HI] quantile band for this game. The main model
+// is the shared yardstick: it gates out each player's exceptional best and worst moves,
+// so the label reflects the player's typical play.
+static vector<int> humanVotingMoves(const vector<PositionSnap>& snaps, const vector<float>& moverLoss) {
+  vector<int> idx[2];
+  for(int i = 0; i < (int)snaps.size() && snaps[i].pos.turn < (size_t)MAX_HUMAN_MOVES; i++)
+    idx[snaps[i].pos.pla == P_BLACK ? 0 : 1].push_back(i);
+  vector<int> sel;
+  for(auto& side : idx) {
+    if(side.empty()) continue;
+    vector<float> v;
+    for(int i : side) v.push_back(moverLoss[i]);
+    float lo = quantileLinear(v, HUMAN_LOSS_BAND_LO), hi = quantileLinear(v, HUMAN_LOSS_BAND_HI);
+    for(int i : side)
+      if(moverLoss[i] >= lo && moverLoss[i] <= hi) sel.push_back(i);
+  }
+  std::sort(sel.begin(), sel.end());
+  return sel;
+}
+
+// HumanSL rank anchor (loss-band gate + fixed profiles + spline posterior) for both players.
+// moverLoss[i]: points the mover of snapshot i gave away per the main model (0 if unknown).
+static void runHumanSLPass(
+  const vector<PositionSnap>& snaps,
+  const vector<float>& moverLoss,
+  NNEvaluator* humanEval,
+  int numThreads,
+  PlayerSummary& sb, PlayerSummary& sw
+) {
+  const vector<int> sel = humanVotingMoves(snaps, moverLoss);
+  const vector<int> prof(std::begin(HUMAN_PROFILES), std::end(HUMAN_PROFILES));
+  vector<double> tB, tW;
+  int nB, nW;
+  if(!humanLogLik(snaps, sel, humanEval, prof, prof, numThreads, tB, tW, nB, nW))
+    return;
+
+  auto finish = [&](const vector<double>& tot, int cnt, PlayerSummary& s) {
+    if(cnt == 0) return;
+    double mean, sd;
+    posteriorMeanSd(splineAtProfiles(prof, tot), mean, sd);
+    s.humanRankIdx   = (float)std::lround(mean);
+    s.humanLogPrior  = (float)(*std::max_element(tot.begin(), tot.end()) / cnt);
+    s.humanRankExp   = (float)mean;
+    s.humanRankSd    = (float)sd;
+    s.humanProfiles  = (float)prof.size();
+    s.humanAnchorVer = HUMAN_ANCHOR_VERSION;
   };
-
-  auto [idxB, meanB] = selectBest(sumLogB, cntB, candB);
-  auto [idxW, meanW] = selectBest(sumLogW, cntW, candW);
-
-  sb.humanRankIdx  = (float)idxB;
-  sb.humanLogPrior = meanB;
-  sw.humanRankIdx  = (float)idxW;
-  sw.humanLogPrior = meanW;
+  finish(tB, nB, sb);
+  finish(tW, nW, sw);
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -636,6 +734,11 @@ int batch_analysis(const vector<string>& args) {
     cfg.initialize(configFile);
   Setup::initializeSession(cfg);
   Board::initHash();
+  // No NN cache: every position is evaluated exactly once, and NNEvaluator stores each
+  // result in the cache even with skipCache=true (skipCache only skips the lookup). With
+  // trunk outputs (~0.74 MB each) the default 2^20-entry cache grew without bound
+  // (~0.17 GB per game) until the host started paging.
+  cfg.overrideKey("nnCacheSizePowerOfTwo", "-1");
 
   int nnXLen = 19, nnYLen = 19;
   auto nnEval = Setup::initializeNNEvaluator(
@@ -674,7 +777,7 @@ int batch_analysis(const vector<string>& args) {
        << (daemonMode ? string("daemon") : std::to_string(entries.size()) + " games")
        << "  trunkCh=" << trunkChFull << "  moveDim=" << (SCALAR_DIM + 2 * trunkChFull)
        << "  headerBytes=" << sizeof(NPZHeader) << "  threads=" << numThreads;
-  if(humanEval) cerr << "  [+HumanSL x" << HUMAN_CANDIDATES << "]";
+  if(humanEval) cerr << "  [+HumanSL x" << (int)(sizeof(HUMAN_PROFILES) / sizeof(int)) << " profiles]";
   if(streamMode) cerr << "  [stream mode" << (noTrunk ? " lite" : "") << "]";
   if(daemonMode) cerr << "  [daemon]";
   cerr << "  output=" << (streamMode ? "stdout" : outputDir) << endl;
@@ -718,9 +821,11 @@ int batch_analysis(const vector<string>& args) {
       vector<float>* prevBuf        = nullptr;
       int            prevRecordIdx  = -1;
       Player         prevPla        = P_BLACK;
+      int            prevSnapIdx    = -1;
 
       // ── Evaluate every position concurrently ────────────────────────────
       vector<PositionSnap> snaps = snapshotGame(sgf.get(), rules, nnXLen, nnYLen, MAX_GAME_MOVES);
+      vector<float> moverLoss(snaps.size(), 0.0f);  // main-model points given away, per move
 
       struct MainEval {
         bool  hasResult = false;
@@ -786,6 +891,7 @@ int batch_analysis(const vector<string>& args) {
           (*prevBuf)[base_ + 9] = sD / 50.0f;
           float pWD = (prevPla == P_BLACK) ? -wD :  wD;
           float pSD = (prevPla == P_BLACK) ? -sD :  sD;
+          moverLoss[prevSnapIdx] = -pSD;
           ((prevPla == P_BLACK) ? accB : accW).addDelta(pWD, pSD);
         }
 
@@ -812,6 +918,7 @@ int batch_analysis(const vector<string>& args) {
         prevBuf       = &dataBuf;
         prevRecordIdx = curIdx;
         prevPla       = pos.pla;
+        prevSnapIdx   = (int)i;
 
         if(pos.pla == P_BLACK) nBlack++; else nWhite++;
       }
@@ -823,9 +930,7 @@ int batch_analysis(const vector<string>& args) {
       // ── HumanSL second pass (optional) ───────────────────────────────────
       if(humanEval && nBlack >= 5 && nWhite >= 5) {
         try {
-          vector<int> candB = rankCandidates(sb.meanLogPrior);
-          vector<int> candW = rankCandidates(sw.meanLogPrior);
-          runHumanSLPass(snaps, humanEval, candB, candW, numThreads, sb, sw);
+          runHumanSLPass(snaps, moverLoss, humanEval, numThreads, sb, sw);
         } catch(const exception& e) {
           cerr << "HumanSL pass failed for game " << gi << ": " << e.what() << endl;
           // sb/sw.humanRankIdx stays -1
@@ -880,7 +985,8 @@ int batch_analysis(const vector<string>& args) {
                  "B_acc1,B_acc3,B_logPrior,B_winRate,B_scoreLead,B_complexity,B_scoreVar,B_drop,"
                  "B_humanRank,B_humanLogPrior,"
                  "W_acc1,W_acc3,W_logPrior,W_winRate,W_scoreLead,W_complexity,W_scoreVar,W_drop,"
-                 "W_humanRank,W_humanLogPrior\n";
+                 "W_humanRank,W_humanLogPrior,"
+                 "B_humanRankExp,B_humanRankSd,W_humanRankExp,W_humanRankSd,humanAnchorVer\n";
         metaHeaderWritten = true;
       }
       {
@@ -896,7 +1002,10 @@ int batch_analysis(const vector<string>& args) {
                << sw.accuracy1 << "," << sw.accuracy3 << "," << sw.meanLogPrior << ","
                << sw.meanWinRate << "," << sw.meanScoreLead << "," << sw.meanComplexity << ","
                << sw.scoreVariance << "," << sw.approxScoreDrop << ","
-               << rankIdxToStr(sw.humanRankIdx) << "," << sw.humanLogPrior << "\n";
+               << rankIdxToStr(sw.humanRankIdx) << "," << sw.humanLogPrior << ","
+               << sb.humanRankExp << "," << sb.humanRankSd << ","
+               << sw.humanRankExp << "," << sw.humanRankSd << ","
+               << std::max(sb.humanAnchorVer, sw.humanAnchorVer) << "\n";
       }
       }
 
