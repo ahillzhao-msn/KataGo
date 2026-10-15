@@ -49,6 +49,7 @@ struct NNResultBuf {
   std::mutex resultMutex;
   bool hasResult;
   bool includeOwnerMap;
+  bool includeTrunk; // fork: ask the backend for trunk features (batch_analysis)
   int boardXSizeForServer;
   int boardYSizeForServer;
   std::vector<float> rowSpatialBuf;

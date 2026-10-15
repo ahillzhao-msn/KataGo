@@ -11,6 +11,7 @@ NNResultBuf::NNResultBuf()
     resultMutex(),
     hasResult(false),
     includeOwnerMap(false),
+    includeTrunk(false),
     boardXSizeForServer(0),
     boardYSizeForServer(0),
     rowSpatialBuf(),
@@ -682,6 +683,7 @@ void NNEvaluator::serve(
           emptyOutput->whiteOwnerMap = new float[nnXLen*nnYLen];
         else
           emptyOutput->whiteOwnerMap = NULL;
+        emptyOutput->includeTrunk = resultBufs[row]->includeTrunk;
         outputBuf.push_back(emptyOutput);
       }
 

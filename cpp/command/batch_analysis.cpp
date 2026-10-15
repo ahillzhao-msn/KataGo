@@ -21,6 +21,10 @@
 // HumanSL (optional, -human-model):
 //   Second pass over each game; tests 3 candidate rank profiles per player
 //   (selected from meanLogPrior estimate); stores best-match rank in PlayerSummary.
+//
+// Evaluation: each pass replays the game into position snapshots, evaluates them
+// on -threads client threads (the NNEvaluator batches concurrent rows), then
+// folds the results in move order, so output is identical to a serial run.
 
 #include "batch_analysis.h"
 
@@ -49,7 +53,9 @@
 #include "../program/play.h"
 #include "../program/setup.h"
 #include <zlib.h>
+#include <atomic>
 #include <chrono>
+#include <thread>
 
 #ifdef _WIN32
 #include <io.h>
@@ -343,91 +349,190 @@ static void appendMoveRecord(
   }
 }
 
-// ─── HumanSL second pass ─────────────────────────────────────────────
+// ─── Shared game replay ──────────────────────────────────────────────
 //
-// Re-replays all moves in the game and queries humanEval with 3 candidate
-// rank profiles for each player.  Updates sb.humanRankIdx / humanLogPrior.
+// Single replay engine with all safety guards: consecutive-color truncation,
+// move limit, null/pass handling, game-finished detection, tolerant board
+// advancement.  Both the main eval pass and HumanSL pass use this, so any
+// new guard added here automatically protects all passes.
 
-static void runHumanSLPass(
+struct ReplayPosition {
+  Player pla;
+  int    rowPos;
+  size_t turn;
+};
+
+enum class ReplayAction { CONTINUE, STOP };
+
+template<typename Visitor>
+static bool replayGame(
   const CompactSgf* sgf, const Rules& rules,
-  NNEvaluator* humanEval,
-  const vector<int>& candB, const vector<int>& candW,
-  int nnXLen, int nnYLen,
-  PlayerSummary& sb, PlayerSummary& sw
+  int nnXLen, int nnYLen, int maxMoves,
+  Visitor& visitor
 ) {
   Board board;
   BoardHistory history;
   Player initialPla;
   sgf->setupInitialBoardAndHist(rules, board, initialPla, history);
 
-  float sumLogB[HUMAN_CANDIDATES] = {}, sumLogW[HUMAN_CANDIDATES] = {};
-  int   cntB  [HUMAN_CANDIDATES] = {}, cntW  [HUMAN_CANDIDATES] = {};
+  Player lastStonePla   = P_BLACK;
+  bool   firstStoneSeen = false;
+  int    evaluated       = 0;
 
-  int evalMoves = 0;
-  bool evalOk   = true;
-
-  for(const Move& move : sgf->moves) {
-    if(!evalOk || evalMoves >= MAX_HUMAN_MOVES) break;
+  const size_t moveLimit = std::min(sgf->moves.size(), (size_t)maxMoves);
+  for(size_t turn = 0; turn < moveLimit; turn++) {
+    const Move& move = sgf->moves[turn];
 
     if(move.loc == Board::NULL_LOC) {
       history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
       continue;
     }
 
-    // Skip evaluation on finished positions but still advance board state.
+    // Consecutive same-color = end-of-game annotation (Chinese dead-stone
+    // marking, etc.).  Truncate — keep all data collected so far.
+    if(firstStoneSeen && move.pla == lastStonePla) {
+      cerr << "  [replay] consecutive " << (move.pla == P_BLACK ? "B" : "W")
+           << " at turn " << turn << " — truncating." << endl;
+      break;
+    }
+    lastStonePla   = move.pla;
+    firstStoneSeen = true;
+
     if(history.isGameFinished) {
       history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
       continue;
     }
 
-    Player evalPla = move.pla;
     int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
-
-    // Sanity-check move is within the evaluation grid.
     if(rowPos < 0 || rowPos >= NNPos::MAX_NN_POLICY_SIZE) {
-      history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+      if(!history.makeBoardMoveTolerant(board, move.loc, move.pla))
+        break;
       continue;
     }
 
-    const vector<int>& cand = (evalPla == P_BLACK) ? candB : candW;
-    float* sumLog = (evalPla == P_BLACK) ? sumLogB : sumLogW;
-    int*   cnt    = (evalPla == P_BLACK) ? cntB    : cntW;
+    ReplayPosition pos{move.pla, rowPos, turn};
+    ReplayAction action = visitor(board, history, pos);
+    if(action == ReplayAction::STOP) break;
+    evaluated++;
 
+    if(!history.makeBoardMoveTolerant(board, move.loc, move.pla))
+      break;
+  }
+  return evaluated > 0;
+}
+
+// ─── Position snapshots + parallel evaluation ────────────────────────
+//
+// Positions within a game are independent NN queries, so each pass first
+// replays the game into snapshots, evaluates them concurrently (the
+// NNEvaluator forms GPU batches from rows queued by concurrent clients), and
+// then folds the results strictly in move order. Folding stops at the first
+// position whose evaluation threw, matching the old serial STOP semantics.
+
+struct PositionSnap {
+  Board board;
+  BoardHistory history;
+  ReplayPosition pos;
+};
+
+static vector<PositionSnap> snapshotGame(
+  const CompactSgf* sgf, const Rules& rules, int nnXLen, int nnYLen, int maxMoves
+) {
+  vector<PositionSnap> snaps;
+  auto collect = [&](const Board& board, const BoardHistory& history,
+                     const ReplayPosition& pos) -> ReplayAction {
+    snaps.push_back(PositionSnap{board, history, pos});
+    return ReplayAction::CONTINUE;
+  };
+  replayGame(sgf, rules, nnXLen, nnYLen, maxMoves, collect);
+  return snaps;
+}
+
+// Run fn(i) for i in [0, n) on up to numThreads threads. fn must not throw.
+template<typename Fn>
+static void parallelFor(int n, int numThreads, Fn&& fn) {
+  int nt = std::min(numThreads, n);
+  if(nt <= 1) {
+    for(int i = 0; i < n; i++) fn(i);
+    return;
+  }
+  std::atomic<int> next(0);
+  auto work = [&]() {
+    for(int i = next.fetch_add(1); i < n; i = next.fetch_add(1))
+      fn(i);
+  };
+  vector<std::thread> threads;
+  threads.reserve(nt - 1);
+  for(int t = 0; t < nt - 1; t++) threads.emplace_back(work);
+  work();
+  for(auto& th : threads) th.join();
+}
+
+// ─── HumanSL second pass ─────────────────────────────────────────────
+
+static void runHumanSLPass(
+  const vector<PositionSnap>& snaps,
+  NNEvaluator* humanEval,
+  const vector<int>& candB, const vector<int>& candW,
+  int numThreads,
+  PlayerSummary& sb, PlayerSummary& sw
+) {
+  float sumLogB[HUMAN_CANDIDATES] = {}, sumLogW[HUMAN_CANDIDATES] = {};
+  int   cntB  [HUMAN_CANDIDATES] = {}, cntW  [HUMAN_CANDIDATES] = {};
+
+  // The HumanSL pass only looks at the first MAX_HUMAN_MOVES turns.
+  int nPos = 0;
+  while(nPos < (int)snaps.size() && snaps[nPos].pos.turn < (size_t)MAX_HUMAN_MOVES) nPos++;
+
+  struct HumanEval { float prob = 0.0f; bool hasResult = false; string error; };
+  vector<HumanEval> evals((size_t)nPos * HUMAN_CANDIDATES);
+
+  parallelFor((int)evals.size(), numThreads, [&](int idx) {
+    const PositionSnap& snap = snaps[idx / HUMAN_CANDIDATES];
+    int k = idx % HUMAN_CANDIDATES;
+    const vector<int>& cand = (snap.pos.pla == P_BLACK) ? candB : candW;
+    SGFMetadata meta = SGFMetadata::getProfile(RANK_PROFILES[cand[k]]);
+
+    NNResultBuf hbuf;
+    hbuf.includeTrunk = false;
+
+    MiscNNInputParams hparams;
+    hparams.symmetry = 0;
+    hparams.policyOptimism = 0.0;
+
+    HumanEval& out = evals[idx];
+    try {
+      humanEval->evaluate(snap.board, snap.history, snap.pos.pla, &meta, hparams, hbuf, true, false);
+      if(hbuf.result) {
+        out.prob = hbuf.result->policyProbs[snap.pos.rowPos];
+        out.hasResult = true;
+      }
+    } catch(const exception& e) {
+      out.error = e.what();
+      if(out.error.empty()) out.error = "unknown error";
+    }
+  });
+
+  bool stopped = false;
+  for(int i = 0; i < nPos && !stopped; i++) {
+    const ReplayPosition& pos = snaps[i].pos;
+    float* sumLog = (pos.pla == P_BLACK) ? sumLogB : sumLogW;
+    int*   cnt    = (pos.pla == P_BLACK) ? cntB    : cntW;
     for(int k = 0; k < HUMAN_CANDIDATES; k++) {
-      SGFMetadata meta = SGFMetadata::getProfile(RANK_PROFILES[cand[k]]);
-
-      NNResultBuf hbuf;
-      hbuf.result = std::make_shared<NNOutput>();
-      hbuf.result->includeTrunk = false;  // policy head only for HumanSL
-      hbuf.result->includePick  = false;
-
-      MiscNNInputParams hparams;
-      hparams.symmetry = 0;
-      hparams.policyOptimism = 0.0;
-
-      try {
-        humanEval->evaluate(board, history, evalPla, &meta, hparams, hbuf, true, false);
-      } catch(const exception& e) {
-        cerr << "HumanSL evaluate exception at move " << evalMoves
-             << " candidate " << k << ": " << e.what() << " — aborting HumanSL pass." << endl;
-        evalOk = false;
+      const HumanEval& ev = evals[(size_t)i * HUMAN_CANDIDATES + k];
+      if(!ev.error.empty()) {
+        cerr << "HumanSL evaluate exception at turn " << pos.turn
+             << " candidate " << k << ": " << ev.error << endl;
+        stopped = true;
         break;
       }
-
-      if(hbuf.result) {
-        float prob = hbuf.result->policyProbs[rowPos];
-        sumLog[k] += std::log(std::max(prob, 1e-10f));
+      if(ev.hasResult) {
+        sumLog[k] += std::log(std::max(ev.prob, 1e-10f));
         cnt[k]++;
       }
     }
-
-    if(!evalOk) break;
-    history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-    evalMoves++;
   }
 
-  // Pick best candidate for each player; {-1, 0} if nothing was evaluated
-  // (e.g. exception on the very first move) so humanRankIdx stays unset.
   auto selectBest = [](const float sl[], const int ct[],
                        const vector<int>& cand) -> pair<int,float> {
     int   bestK    = -1;
@@ -460,6 +565,7 @@ int batch_analysis(const vector<string>& args) {
   string listFile, sgfDir, outputDir = ".";
   int visits = 0, minMoves = 10, maxGames = 0;
   int maxBatchSize = 64;   // NN batch size for NNEvaluator; higher = larger GPU batches
+  int numThreads   = 16;   // client threads evaluating positions concurrently
   bool profile     = false; // hidden: print per-game timing breakdown
   bool streamMode = false;   // -stream: write frames to stdout instead of files
   bool noTrunk    = false;   // -no-trunk: scalars only (10 floats/move), skip trunk/pick
@@ -476,6 +582,7 @@ int batch_analysis(const vector<string>& args) {
     else if(args[i] == "-min-moves"   && i+1 < args.size()) minMoves       = stoi(args[++i]);
     else if(args[i] == "-max-games"   && i+1 < args.size()) maxGames       = stoi(args[++i]);
     else if(args[i] == "-batch-size"  && i+1 < args.size()) maxBatchSize   = stoi(args[++i]);
+    else if(args[i] == "-threads"     && i+1 < args.size()) numThreads     = std::max(1, stoi(args[++i]));
     else if(args[i] == "-stream")      streamMode = true;
     else if(args[i] == "-no-trunk")    noTrunk    = true;
     else if(args[i] == "-daemon")      daemonMode = true;
@@ -488,7 +595,7 @@ int batch_analysis(const vector<string>& args) {
     cerr << "  [-list <games.csv> | -sgf-dir <dir/>] [-output-dir <out/>]" << endl;
     cerr << "  [-visits N] [-min-moves N] [-max-games N]" << endl;
     cerr << "  [-stream] [-no-trunk]" << endl;
-    cerr << "  [-batch-size N (default 64)]" << endl;
+    cerr << "  [-batch-size N (default 64)] [-threads N (default 16)]" << endl;
     cerr << "  [-human-model <human.bin.gz>]" << endl;
     cerr << endl;
     cerr << "  -stream    Write KAB2 frames to stdout instead of files." << endl;
@@ -524,7 +631,9 @@ int batch_analysis(const vector<string>& args) {
 
   Logger logger;
   Rand seedRand;
-  ConfigParser cfg = configFile.empty() ? ConfigParser() : ConfigParser(configFile);
+  ConfigParser cfg;
+  if(!configFile.empty())
+    cfg.initialize(configFile);
   Setup::initializeSession(cfg);
   Board::initHash();
 
@@ -564,7 +673,7 @@ int batch_analysis(const vector<string>& args) {
   cerr << "batch-analysis: "
        << (daemonMode ? string("daemon") : std::to_string(entries.size()) + " games")
        << "  trunkCh=" << trunkChFull << "  moveDim=" << (SCALAR_DIM + 2 * trunkChFull)
-       << "  headerBytes=" << sizeof(NPZHeader);
+       << "  headerBytes=" << sizeof(NPZHeader) << "  threads=" << numThreads;
   if(humanEval) cerr << "  [+HumanSL x" << HUMAN_CANDIDATES << "]";
   if(streamMode) cerr << "  [stream mode" << (noTrunk ? " lite" : "") << "]";
   if(daemonMode) cerr << "  [daemon]";
@@ -592,21 +701,9 @@ int batch_analysis(const vector<string>& args) {
       auto sgf = CompactSgf::loadFile(entry.sgfPath);
       if(!sgf) { failed++; continue; }
 
-      auto& moves = sgf->moves;
-      if((int)moves.size() < minMoves) { skipped++; continue; }
-
-      // Truncate runaway games from corrupted SGFs.
-      const size_t moveLimit = (moves.size() > (size_t)MAX_GAME_MOVES)
-                               ? (size_t)MAX_GAME_MOVES : moves.size();
-      if(moves.size() > (size_t)MAX_GAME_MOVES)
-        cerr << "Warning: game " << gi << " has " << moves.size()
-             << " moves; truncating to " << MAX_GAME_MOVES << endl;
+      if((int)sgf->moves.size() < minMoves) { skipped++; continue; }
 
       Rules rules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
-      Board board;
-      BoardHistory history;
-      Player initialPla;
-      sgf->setupInitialBoardAndHist(rules, board, initialPla, history);
 
       vector<float> data_B, data_W;
       data_B.reserve(80 * moveDim);
@@ -622,111 +719,101 @@ int batch_analysis(const vector<string>& args) {
       int            prevRecordIdx  = -1;
       Player         prevPla        = P_BLACK;
 
-      // Alternation tracking: consecutive same-color stone → truncate, not reject.
-      Player lastStonePla    = P_BLACK;
-      bool   firstStoneSeen  = false;
+      // ── Evaluate every position concurrently ────────────────────────────
+      vector<PositionSnap> snaps = snapshotGame(sgf.get(), rules, nnXLen, nnYLen, MAX_GAME_MOVES);
 
-      bool gameEvalOk = true;
-      for(size_t turn = 0; turn < moveLimit; turn++) {
-        if(!gameEvalOk) break;
-        const Move& move = moves[turn];
-        if(move.loc == Board::NULL_LOC) {
-          history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-          continue;
-        }
+      struct MainEval {
+        bool  hasResult = false;
+        string error;
+        float whiteWinProb = 0.0f, whiteScoreMean = 0.0f, complexity = 0.0f;
+        float policyPrior = 0.0f;
+        int   rank = 0;
+        vector<float> record;   // one appendMoveRecord block (moveDim floats)
+      };
+      vector<MainEval> evals(snaps.size());
 
-        // Consecutive same-color stone placement = game effectively ended; keep data so far.
-        if(firstStoneSeen && move.pla == lastStonePla) {
-          cerr << "  Game " << gi << " (" << entry.sgfPath << "): consecutive "
-               << (move.pla == P_BLACK ? "B" : "W") << " at turn " << turn
-               << " — truncating." << endl;
-          break;
-        }
-        lastStonePla   = move.pla;
-        firstStoneSeen = true;
-
-        // Skip evaluation on finished positions.
-        if(history.isGameFinished) {
-          history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
-          continue;
-        }
-
-        Player evalPla = move.pla;
-        int rowPos = NNPos::locToPos(move.loc, board.x_size, nnXLen, nnYLen);
-
+      Clock::time_point evalStart = Clock::now();
+      parallelFor((int)snaps.size(), numThreads, [&](int i) {
+        const PositionSnap& snap = snaps[i];
         NNResultBuf nnbuf;
-        nnbuf.result = std::make_shared<NNOutput>();
-        nnbuf.result->includeTrunk = !noTrunk;  // skip trunk in lite mode
-        nnbuf.result->includePick  = false;  // we extract pick from trunk directly
+        nnbuf.includeTrunk = !noTrunk;
 
         MiscNNInputParams params;
         params.symmetry = 0;
         params.policyOptimism = 0.0;
+
+        MainEval& ev = evals[i];
         try {
-          Clock::time_point t0 = Clock::now();
-          nnEval->evaluate(board, history, evalPla, params, nnbuf, true, false);
-          Clock::time_point t1 = Clock::now();
-          double evalMs = chrono::duration<double, milli>(t1 - t0).count();
-          gameNNEvalMs += evalMs;
+          nnEval->evaluate(snap.board, snap.history, snap.pos.pla, params, nnbuf, true, false);
         } catch(const exception& e) {
-          cerr << "Evaluate exception at game " << gi << " move " << turn
-               << ": " << e.what() << " — skipping rest of game." << endl;
-          gameEvalOk = false;
+          ev.error = e.what();
+          if(ev.error.empty()) ev.error = "unknown error";
+          return;
+        }
+        const NNOutput* output = nnbuf.result.get();
+        if(!output) return;
+
+        ev.hasResult      = true;
+        ev.whiteWinProb   = output->whiteWinProb;
+        ev.whiteScoreMean = output->whiteScoreMean;
+        ev.complexity     = output->shorttermScoreError;
+        ev.policyPrior    = output->policyProbs[snap.pos.rowPos];
+        for(int p = 0; p < NNPos::MAX_NN_POLICY_SIZE; p++)
+          if(output->policyProbs[p] > ev.policyPrior) ev.rank++;
+        ev.record.reserve(moveDim);
+        appendMoveRecord(ev.record, output, snap.pos.pla, ev.policyPrior, ev.rank,
+                         snap.pos.rowPos, trunkCh, nnXLen, nnYLen);
+      });
+      gameNNEvalMs += chrono::duration<double, milli>(Clock::now() - evalStart).count();
+
+      // ── Fold results in move order ──────────────────────────────────────
+      for(size_t i = 0; i < snaps.size(); i++) {
+        const ReplayPosition& pos = snaps[i].pos;
+        const MainEval& ev = evals[i];
+        if(!ev.error.empty()) {
+          cerr << "Evaluate exception at game " << gi << " turn " << pos.turn
+               << ": " << ev.error << endl;
           break;
         }
-        NNOutput* output = nnbuf.result.get();
+        if(!ev.hasResult) continue;
 
-        if(output) {
-          // ── 1. Fill deferred delta into previous record ──────────────────
-          if(hasPrevEval && prevBuf && prevRecordIdx >= 0) {
-            float wD = output->whiteWinProb   - prevWinProb;
-            float sD = output->whiteScoreMean - prevScoreMean;
-            int base_ = prevRecordIdx * moveDim;
-            (*prevBuf)[base_ + 8] = wD;
-            (*prevBuf)[base_ + 9] = sD / 50.0f;
-            float pWD = (prevPla == P_BLACK) ? -wD :  wD;
-            float pSD = (prevPla == P_BLACK) ? -sD :  sD;
-            ((prevPla == P_BLACK) ? accB : accW).addDelta(pWD, pSD);
-          }
-
-          // ── 2. Move-level stats (computed once, shared by acc + record) ──
-          float policyPrior = (rowPos >= 0 && rowPos < NNPos::MAX_NN_POLICY_SIZE)
-                              ? output->policyProbs[rowPos] : 0.0f;
-          int rank = 0;
-          for(int i = 0; i < NNPos::MAX_NN_POLICY_SIZE; i++)
-            if(output->policyProbs[i] > policyPrior) rank++;
-
-          float playerWinRate   = (evalPla == P_BLACK)
-                                  ? 1.0f - output->whiteWinProb
-                                  : output->whiteWinProb;
-          float playerScoreLead = (evalPla == P_BLACK)
-                                  ? -output->whiteScoreMean
-                                  :  output->whiteScoreMean;
-
-          // ── 3. Update accumulator ─────────────────────────────────────────
-          ((evalPla == P_BLACK) ? accB : accW).addMove(
-            rank, policyPrior, playerWinRate, playerScoreLead,
-            output->shorttermScoreError
-          );
-
-          // ── 4. Append record (delta slots pre-zeroed, filled above) ──────
-          int curIdx = (evalPla == P_BLACK) ? nBlack : nWhite;
-          auto& dataBuf = (evalPla == P_BLACK) ? data_B : data_W;
-          appendMoveRecord(dataBuf, output, evalPla, policyPrior, rank, rowPos,
-                           trunkCh, nnXLen, nnYLen);
-
-          // ── 5. Advance deferred-delta tracking ───────────────────────────
-          prevWinProb   = output->whiteWinProb;
-          prevScoreMean = output->whiteScoreMean;
-          hasPrevEval   = true;
-          prevBuf       = &dataBuf;
-          prevRecordIdx = curIdx;
-          prevPla       = evalPla;
-
-          if(evalPla == P_BLACK) nBlack++; else nWhite++;
+        // ── 1. Deferred delta fill ──────────────────────────────────────
+        if(hasPrevEval && prevBuf && prevRecordIdx >= 0) {
+          float wD = ev.whiteWinProb   - prevWinProb;
+          float sD = ev.whiteScoreMean - prevScoreMean;
+          int base_ = prevRecordIdx * moveDim;
+          (*prevBuf)[base_ + 8] = wD;
+          (*prevBuf)[base_ + 9] = sD / 50.0f;
+          float pWD = (prevPla == P_BLACK) ? -wD :  wD;
+          float pSD = (prevPla == P_BLACK) ? -sD :  sD;
+          ((prevPla == P_BLACK) ? accB : accW).addDelta(pWD, pSD);
         }
 
-        history.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr, true);
+        // ── 2. Move-level stats ─────────────────────────────────────────
+        float playerWinRate   = (pos.pla == P_BLACK)
+                                ? 1.0f - ev.whiteWinProb : ev.whiteWinProb;
+        float playerScoreLead = (pos.pla == P_BLACK)
+                                ? -ev.whiteScoreMean : ev.whiteScoreMean;
+
+        // ── 3. Update accumulator ───────────────────────────────────────
+        ((pos.pla == P_BLACK) ? accB : accW).addMove(
+          ev.rank, ev.policyPrior, playerWinRate, playerScoreLead, ev.complexity
+        );
+
+        // ── 4. Append feature record ────────────────────────────────────
+        int curIdx = (pos.pla == P_BLACK) ? nBlack : nWhite;
+        auto& dataBuf = (pos.pla == P_BLACK) ? data_B : data_W;
+        dataBuf.insert(dataBuf.end(), ev.record.begin(), ev.record.end());
+
+        // ── 5. Advance deferred-delta tracking ──────────────────────────
+        prevWinProb   = ev.whiteWinProb;
+        prevScoreMean = ev.whiteScoreMean;
+        hasPrevEval   = true;
+        prevBuf       = &dataBuf;
+        prevRecordIdx = curIdx;
+        prevPla       = pos.pla;
+
+        if(pos.pla == P_BLACK) nBlack++; else nWhite++;
       }
 
       // ── PlayerSummary from first pass ────────────────────────────────────
@@ -738,8 +825,7 @@ int batch_analysis(const vector<string>& args) {
         try {
           vector<int> candB = rankCandidates(sb.meanLogPrior);
           vector<int> candW = rankCandidates(sw.meanLogPrior);
-          runHumanSLPass(sgf.get(), rules, humanEval,
-                         candB, candW, nnXLen, nnYLen, sb, sw);
+          runHumanSLPass(snaps, humanEval, candB, candW, numThreads, sb, sw);
         } catch(const exception& e) {
           cerr << "HumanSL pass failed for game " << gi << ": " << e.what() << endl;
           // sb/sw.humanRankIdx stays -1
@@ -802,7 +888,7 @@ int batch_analysis(const vector<string>& args) {
         if(meta)
           meta << base << "," << entry.playerBlack << "," << entry.playerWhite << ","
                << entry.blackElo << "," << entry.whiteElo << ","
-               << moves.size() << "," << nBlack << "," << nWhite << "," << entry.set << ","
+               << sgf->moves.size() << "," << nBlack << "," << nWhite << "," << entry.set << ","
                << sb.accuracy1 << "," << sb.accuracy3 << "," << sb.meanLogPrior << ","
                << sb.meanWinRate << "," << sb.meanScoreLead << "," << sb.meanComplexity << ","
                << sb.scoreVariance << "," << sb.approxScoreDrop << ","
@@ -817,6 +903,9 @@ int batch_analysis(const vector<string>& args) {
       success++;
     } catch(const exception& e) {
       cerr << "Error on game " << gi << " (" << entry.sgfPath << "): " << e.what() << endl;
+      failed++;
+    } catch(...) {
+      cerr << "Unknown error on game " << gi << " (" << entry.sgfPath << ") — skipping." << endl;
       failed++;
     }
 
