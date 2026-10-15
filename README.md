@@ -2,7 +2,7 @@
 
 This fork extends **[lightvector/KataGo](https://github.com/lightvector/KataGo)** with trunk feature extraction, batch SGF analysis, daemon/stream modes, and HumanSL rank assessment for Go strength evaluation models.
 
-**Based on:** upstream `master` (v1.16.5+) | **Backends:** OpenCL + CUDA + TensorRT | **Format:** KAB2 (zlib-compressed)
+**Based on:** upstream `master` (last merge `92e62759`, 2026-06-22) | **Format:** KAB2 | **Trunk features:** OpenCL backend only (other backends must use `-no-trunk`)
 
 > **Upstream README** → See [lightvector/KataGo](https://github.com/lightvector/KataGo) for the original project documentation, including installation, GUI setup, GTP usage, training, and full feature list.
 
@@ -12,13 +12,14 @@ This fork extends **[lightvector/KataGo](https://github.com/lightvector/KataGo)*
 
 | Component | Description |
 |-----------|-------------|
-| **`batch_analysis` command** | Batch SGF analysis: extract head(12-dim) + trunk(256-dim) + pick(256-dim) features from neural net. KAB2 binary output with zlib compression. |
+| **`batch_analysis` command** | Batch SGF analysis: per-move scalars (10) + pick + avg-pooled trunk (trunk channels, e.g. 512), plus a per-player summary. KAB2 binary output. |
 | **Stream mode** | Pipe KAB2 frames to stdout — zero disk I/O, suitable for pipeline processing. |
 | **Daemon mode** | Model-resident persistent process: task latency drops from ~10s+ to analysis-only time. stdin interface: one games.csv path per line; `reset` clears cache; `quit` exits. |
 | **Lite mode** | Scalars-only (10 floats/move), 100x smaller output — ideal for rank inference pipelines. |
-| **HumanSL rank assessment** | Optional second pass with a human-style model to annotate player rank (20k–9d) and confidence. |
-| **Trunk/Pick output** | `includeTrunk`/`includePick` flags in NNOutput; OpenCL backend reads trunk buffer from GPU. Zero performance impact when disabled. |
-| **SGF naming** | Output files named after original SGF filename (not hex IDs). Meta CSV includes `sgf_path` column. |
+| **HumanSL rank anchor (v2)** | Optional second pass (`-human-model`): loss-gated moves scored at 5 fixed profiles, spline posterior over 20k–9d → rank mean / sd per player. |
+| **Trunk/Pick output** | `includeTrunk`/`includePick` flags in NNOutput; OpenCL backend reads trunk buffer from GPU. Zero performance impact when disabled. `batch_analysis` refuses to run with trunk on a backend that returns none. |
+| **Concurrency** | `-threads N` (default 16) evaluates positions concurrently; output is identical to a serial run. NN cache is off (each position is evaluated once). |
+| **SGF naming** | Output files named after the original SGF filename (not hex IDs). |
 
 ## Quick Start
 
@@ -64,15 +65,15 @@ Each `.npz` file contains combined+compressed per-player data:
 [4B Black payload size][Black KAB2 data][4B White payload size][White KAB2 data]
 ```
 
-KAB2 payload: 96-byte header (with PlayerSummary) + per-move scalars(10) + pick(C) + avgTrunk(C) float32.
+KAB2 payload: 96-byte header (with PlayerSummary) + per-move scalars(10) + pick(C) + avgTrunk(C) float32 (C = 0 with `-no-trunk`).
 
-Output naming: `<sgf_stem>_B.npz` / `<sgf_stem>_W.npz`
+Output naming: `<sgf_stem>.npz` (both players in one file), plus `_meta.csv`.
 
-See [docs/katago-customization.md](docs/katago-customization.md) for in-depth upgrade strategy and internals.
+See [docs/katago-customization.md](docs/katago-customization.md) for the full flag list, stream / daemon protocol, scalar layout, HumanSL anchor, and upgrade procedure.
 
 ## Design & Research
 
-- **[STRENGTH_MODEL_RESEARCH.md](./STRENGTH_MODEL_RESEARCH.md)** — comprehensive technical analysis: trunk features, HumanSL integration, representation theory, scoring system design, and KAB2 format specification.
+- **[STRENGTH_MODEL_RESEARCH.md](./STRENGTH_MODEL_RESEARCH.md)** — research record: trunk features, HumanSL, representation theory, scoring design (not the current spec; see the customization guide).
 - **[docs/katago-customization.md](./docs/katago-customization.md)** — detailed code modifications and upgrade strategy.
 
 ## Credits
