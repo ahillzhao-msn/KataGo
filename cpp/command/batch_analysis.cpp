@@ -18,9 +18,11 @@
 //   [8] winDelta    (whiteWinProb[t+1]  - whiteWinProb[t],   deferred fill)
 //   [9] scoreDelta/50 (whiteScoreMean[t+1] - whiteScoreMean[t], deferred fill)
 //
-// HumanSL (optional, -human-model):
-//   Second pass over each game; tests 3 candidate rank profiles per player
-//   (selected from meanLogPrior estimate); stores best-match rank in PlayerSummary.
+// HumanSL (optional, -human-model): objective rank anchor v2 (HUMAN_ANCHOR_VERSION).
+//   Second pass over each game at 5 fixed rank profiles (20k/13k/6k/2d/9d); only each
+//   player's moves inside their 10–90% point-loss band vote; a natural spline over the
+//   5 log-likelihood totals gives a posterior over all 29 ranks, whose mean/sd go into
+//   PlayerSummary (see humanVotingMoves / splineAtProfiles below).
 //
 // Evaluation: each pass replays the game into position snapshots, evaluates them
 // on -threads client threads (the NNEvaluator batches concurrent rows), then
@@ -751,6 +753,22 @@ int batch_analysis(const vector<string>& args) {
   const int trunkChFull = nnEval->getModelTrunkNumChannels();
   const int trunkCh     = noTrunk ? 0 : trunkChFull;  // 0 = scalars-only mode
   const int moveDim     = SCALAR_DIM + 2 * trunkCh;
+
+  // Trunk features need backend support (only the OpenCL backend reads them back).
+  // Without it every pick/avgTrunk would silently be zero, so probe once and refuse.
+  if(!noTrunk) {
+    Board board(nnXLen, nnYLen);
+    BoardHistory history(board, P_BLACK, Rules::getTrompTaylorish(), 0);
+    NNResultBuf probe;
+    probe.includeTrunk = true;
+    MiscNNInputParams params;
+    nnEval->evaluate(board, history, P_BLACK, params, probe, true, false);
+    if(!probe.result || probe.result->trunk == nullptr) {
+      cerr << "Error: this backend returned no trunk features (only the OpenCL backend"
+              " reads them back). Use an OpenCL build, or pass -no-trunk." << endl;
+      return 1;
+    }
+  }
 
   // Optional HumanSL evaluator
   NNEvaluator* humanEval = nullptr;
