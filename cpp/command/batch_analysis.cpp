@@ -734,6 +734,11 @@ int batch_analysis(const vector<string>& args) {
     cfg.initialize(configFile);
   Setup::initializeSession(cfg);
   Board::initHash();
+  // No NN cache: every position is evaluated exactly once, and NNEvaluator stores each
+  // result in the cache even with skipCache=true (skipCache only skips the lookup). With
+  // trunk outputs (~0.74 MB each) the default 2^20-entry cache grew without bound
+  // (~0.17 GB per game) until the host started paging.
+  cfg.overrideKey("nnCacheSizePowerOfTwo", "-1");
 
   int nnXLen = 19, nnYLen = 19;
   auto nnEval = Setup::initializeNNEvaluator(
