@@ -2,6 +2,12 @@
 
 > 本文档记录围绕 KataGo trunk 特征提取、HumanSL 分析、可解释性与棋力评分模型的完整技术框架。  
 > 基于项目讨论整理，供后续开发查阅。
+>
+> **2026-10-15 状态**：这是研究记录，不是当前实现的规格。当前的 `batch_analysis` 参数、KAB2 格式和
+> HumanSL 锚点以 [docs/katago-customization.md](docs/katago-customization.md) 为准。主要变化：
+> §14 的"3 个候选段位窗口"已被锚点 v2（损失门控 + 5 个固定档位 + 样条后验）取代；
+> §13.5 的 `_meta.csv` 末尾追加了 `*_humanRankExp/Sd` 与 `humanAnchorVer` 列；
+> §5.2 的 analysis 接口 `humanPolicy` 实测与 C++ 直接调用 HumanSL 不一致，不能当标准答案。
 
 ---
 
@@ -927,7 +933,7 @@ W_humanRank, W_humanLogPrior
 
 ## 十四、HumanSL 集成策略与开销分析
 
-> **状态：已实现（batch_analysis.cpp v3）**
+> **状态：v1 实现，已被锚点 v2 取代（2026-10，见 docs/katago-customization.md）**
 > 通过 `-human-model` 参数启用。对每局每棋手，先用主模型 meanLogPrior 估算候选段位范围，
 > 再调用 HumanSL 模型查询 3 个候选段位，最终结果写入 `PlayerSummary.humanRankIdx`。
 
