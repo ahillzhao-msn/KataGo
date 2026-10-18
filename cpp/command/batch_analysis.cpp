@@ -18,11 +18,12 @@
 //   [8] winDelta    (whiteWinProb[t+1]  - whiteWinProb[t],   deferred fill)
 //   [9] scoreDelta/50 (whiteScoreMean[t+1] - whiteScoreMean[t], deferred fill)
 //
-// HumanSL (optional, -human-model): objective rank anchor v2 (HUMAN_ANCHOR_VERSION).
-//   Second pass over each game at 5 fixed rank profiles (20k/13k/6k/2d/9d); only each
-//   player's moves inside their 10–90% point-loss band vote; a natural spline over the
-//   5 log-likelihood totals gives a posterior over all 29 ranks, whose mean/sd go into
-//   PlayerSummary (see humanVotingMoves / splineAtProfiles below).
+// HumanSL (optional, -human-model): objective rank anchor v3 (HUMAN_ANCHOR_VERSION).
+//   Second pass over each game: only each player's moves inside their 10–90% point-loss
+//   band vote; they are scored at 7 coarse rank profiles, then at the profiles within ±2
+//   of the coarse estimate; a natural spline over all scored log-likelihood totals gives
+//   a posterior over all 29 ranks, whose mean/sd go into PlayerSummary (see
+//   humanVotingMoves / humanRefineProfiles / splineAtProfiles below).
 //
 // Evaluation: each pass replays the game into position snapshots, evaluates them
 // on -threads client threads (the NNEvaluator batches concurrent rows), then
@@ -94,17 +95,22 @@ static string rankIdxToStr(float idx) {
 //   1. gate: the main model scores every move; per player, only moves whose point loss
 //      lies inside that player's 10–90% quantile band for the game vote (see
 //      humanVotingMoves) — the main model is the shared yardstick, HumanSL the ruler;
-//   2. total HumanSL log-likelihood of the voting moves under 5 fixed profiles;
-//   3. a natural cubic spline over those totals gives a posterior over all 29 profiles
-//      (flat prior);
+//   2. coarse: total HumanSL log-likelihood of the voting moves under 7 fixed profiles;
+//      a natural cubic spline over them gives a posterior (flat prior) and its mean c;
+//   3. refine: the profiles within ±HUMAN_REFINE_RADIUS of round(c) are scored too, and
+//      the spline is refit through every scored profile;
 //   4. label = posterior mean rank (continuous), with posterior sd as its spread.
-// Work ≈ 14% of an all-moves x 29-profile scan. On 160 players (80 games) its split-half
-// stability matched the full scan's (r 0.78 vs 0.78, bootstrap se 0.04); 4 profiles was
-// the measured floor, 3 profiles collapsed (r 0.70).
-static const int HUMAN_PROFILES[] = {0, 7, 14, 21, 28};  // 20k, 13k, 6k, 2d, 9d
+// Work ≤ 11 profiles (38% of an all-moves x 29-profile scan). Paired against the full scan
+// on 600 players (300 V-set games, same gate): mean |err| 0.02 ranks, max 0.59, rounded
+// label equal 98%. The v2 anchor (5 fixed profiles, no refine) had split-half stability
+// close to the full scan's but was biased: mean |err| 0.65, max 5.2, rounded label equal
+// 46%, and 8k–5k players were labelled 1.25 ranks low — 7 knots apart, the spline
+// misses the likelihood curve's shape.
+static const int HUMAN_COARSE_PROFILES[] = {0, 5, 10, 15, 20, 25, 28};  // 20k … 9d
+static const int HUMAN_REFINE_RADIUS = 2;
 static const double HUMAN_LOSS_BAND_LO = 0.10;   // see humanVotingMoves
 static const double HUMAN_LOSS_BAND_HI = 0.90;
-static const float HUMAN_ANCHOR_VERSION = 2.0f;  // 1 = legacy 3-profile window
+static const float HUMAN_ANCHOR_VERSION = 3.0f;  // 2 = 5 fixed profiles; 1 = legacy window
 
 // Natural cubic spline through (xs[i], ys[i]) (xs strictly increasing), evaluated at
 // each integer profile index 0..NUM_RANK_PROFILES-1.
@@ -625,7 +631,38 @@ static vector<int> humanVotingMoves(const vector<PositionSnap>& snaps, const vec
   return sel;
 }
 
-// HumanSL rank anchor (loss-band gate + fixed profiles + spline posterior) for both players.
+// Profiles within ±HUMAN_REFINE_RADIUS of the coarse posterior mean that the coarse pass
+// did not score. Empty when the player had no voting moves.
+static vector<int> humanRefineProfiles(const vector<int>& coarse, const vector<double>& tot, int cnt) {
+  vector<int> out;
+  if(cnt == 0) return out;
+  double mean, sd;
+  posteriorMeanSd(splineAtProfiles(coarse, tot), mean, sd);
+  int c = (int)std::lround(mean);
+  int lo = std::max(0, c - HUMAN_REFINE_RADIUS);
+  int hi = std::min(NUM_RANK_PROFILES - 1, c + HUMAN_REFINE_RADIUS);
+  for(int k = lo; k <= hi; k++)
+    if(!std::binary_search(coarse.begin(), coarse.end(), k)) out.push_back(k);
+  return out;
+}
+
+// Coarse and refine totals merged into one profile-sorted series for the spline.
+static void mergeProfileTotals(
+  const vector<int>& coarse, const vector<double>& coarseTot,
+  const vector<int>& extra, const vector<double>& extraTot,
+  vector<int>& prof, vector<double>& tot
+) {
+  vector<std::pair<int, double>> pts;
+  for(size_t k = 0; k < coarse.size(); k++) pts.emplace_back(coarse[k], coarseTot[k]);
+  for(size_t k = 0; k < extra.size(); k++) pts.emplace_back(extra[k], extraTot[k]);
+  std::sort(pts.begin(), pts.end());
+  prof.clear();
+  tot.clear();
+  for(const auto& p : pts) { prof.push_back(p.first); tot.push_back(p.second); }
+}
+
+// HumanSL rank anchor (loss-band gate + coarse/refine profiles + spline posterior) for both
+// players.
 // moverLoss[i]: points the mover of snapshot i gave away per the main model (0 if unknown).
 static void runHumanSLPass(
   const vector<PositionSnap>& snaps,
@@ -635,14 +672,26 @@ static void runHumanSLPass(
   PlayerSummary& sb, PlayerSummary& sw
 ) {
   const vector<int> sel = humanVotingMoves(snaps, moverLoss);
-  const vector<int> prof(std::begin(HUMAN_PROFILES), std::end(HUMAN_PROFILES));
-  vector<double> tB, tW;
+  const vector<int> coarse(std::begin(HUMAN_COARSE_PROFILES), std::end(HUMAN_COARSE_PROFILES));
+  vector<double> cB, cW;
   int nB, nW;
-  if(!humanLogLik(snaps, sel, humanEval, prof, prof, numThreads, tB, tW, nB, nW))
+  if(!humanLogLik(snaps, sel, humanEval, coarse, coarse, numThreads, cB, cW, nB, nW))
     return;
 
-  auto finish = [&](const vector<double>& tot, int cnt, PlayerSummary& s) {
+  const vector<int> xB = humanRefineProfiles(coarse, cB, nB);
+  const vector<int> xW = humanRefineProfiles(coarse, cW, nW);
+  vector<double> rB, rW;
+  int mB, mW;
+  if((!xB.empty() || !xW.empty())
+     && !humanLogLik(snaps, sel, humanEval, xB, xW, numThreads, rB, rW, mB, mW))
+    return;
+
+  auto finish = [&](const vector<double>& coarseTot, int cnt, const vector<int>& extra,
+                    const vector<double>& extraTot, PlayerSummary& s) {
     if(cnt == 0) return;
+    vector<int> prof;
+    vector<double> tot;
+    mergeProfileTotals(coarse, coarseTot, extra, extraTot, prof, tot);
     double mean, sd;
     posteriorMeanSd(splineAtProfiles(prof, tot), mean, sd);
     s.humanRankIdx   = (float)std::lround(mean);
@@ -652,8 +701,8 @@ static void runHumanSLPass(
     s.humanProfiles  = (float)prof.size();
     s.humanAnchorVer = HUMAN_ANCHOR_VERSION;
   };
-  finish(tB, nB, sb);
-  finish(tW, nW, sw);
+  finish(cB, nB, xB, rB, sb);
+  finish(cW, nW, xW, rW, sw);
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -795,7 +844,8 @@ int batch_analysis(const vector<string>& args) {
        << (daemonMode ? string("daemon") : std::to_string(entries.size()) + " games")
        << "  trunkCh=" << trunkChFull << "  moveDim=" << (SCALAR_DIM + 2 * trunkChFull)
        << "  headerBytes=" << sizeof(NPZHeader) << "  threads=" << numThreads;
-  if(humanEval) cerr << "  [+HumanSL x" << (int)(sizeof(HUMAN_PROFILES) / sizeof(int)) << " profiles]";
+  if(humanEval) cerr << "  [+HumanSL x" << (int)(sizeof(HUMAN_COARSE_PROFILES) / sizeof(int))
+                     << " profiles, refine ±" << HUMAN_REFINE_RADIUS << "]";
   if(streamMode) cerr << "  [stream mode" << (noTrunk ? " lite" : "") << "]";
   if(daemonMode) cerr << "  [daemon]";
   cerr << "  output=" << (streamMode ? "stdout" : outputDir) << endl;
