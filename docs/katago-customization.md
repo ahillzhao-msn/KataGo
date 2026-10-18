@@ -65,22 +65,28 @@ Scalars (white's perspective): `whiteWin`, `whiteLoss`, `whiteNoResult`, `whiteS
 complexity, score variance, approximate score drop, mean win / score delta, then the HumanSL
 fields below.
 
-## HumanSL rank anchor (v2, `-human-model`)
+## HumanSL rank anchor (v3, `-human-model`)
 
 A second pass scores each game with the HumanSL model:
 
 1. **Gate**: the main model's point loss is computed for every move; for each player only the moves
    inside that player's 10–90% loss quantile band vote.
-2. **Profiles**: the voting moves are scored at 5 fixed rank profiles: 20k, 13k, 6k, 2d, 9d.
-3. **Posterior**: a natural cubic spline through the 5 log-likelihood totals gives a posterior over
-   all 29 ranks (20k … 9d).
+2. **Coarse**: the voting moves are scored at 7 fixed rank profiles: 20k, 15k, 10k, 5k, 1d, 6d, 9d.
+3. **Refine**: a natural cubic spline through the coarse totals gives a posterior mean c; the
+   profiles within ±2 of round(c) that the coarse pass skipped are scored too.
+4. **Posterior**: a natural cubic spline through all scored log-likelihood totals gives a posterior
+   over all 29 ranks (20k … 9d).
 
 Written to `PlayerSummary`: `humanRankIdx` (rounded posterior mean, `-1` if not run),
-`humanRankExp` (posterior mean), `humanRankSd`, `humanProfiles` (5), `humanAnchorVer` (2; 0 = absent),
-and `humanLogPrior`. `_meta.csv` has the matching columns.
+`humanRankExp` (posterior mean), `humanRankSd`, `humanProfiles` (profiles scored for that player,
+at most 11), `humanAnchorVer` (3; 2 = the 5-fixed-profile v2 anchor; 0 = absent), and
+`humanLogPrior`. `_meta.csv` has the matching columns.
 
-Measured on GOPredict games: split-half reliability r = 0.775 (full 29-profile scan: 0.78) at about
-14% of the full scan's compute.
+Measured on GOPredict games, paired against a full 29-profile scan of the same gated moves
+(600 players, 300 games): mean |error| 0.02 ranks, max 0.59, rounded label equal 98%, at about
+38% of the full scan's compute. The v2 anchor (5 fixed profiles, no refine) reached split-half
+reliability close to the full scan's, but against it had mean |error| 0.65, max 5.2, rounded label
+equal 46%, and labelled 8k–5k players 1.25 ranks low.
 
 ## Reproducibility
 

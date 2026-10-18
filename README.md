@@ -16,7 +16,7 @@ This fork extends **[lightvector/KataGo](https://github.com/lightvector/KataGo)*
 | **Stream mode** | Pipe KAB2 frames to stdout — zero disk I/O, suitable for pipeline processing. |
 | **Daemon mode** | Model-resident persistent process: task latency drops from ~10s+ to analysis-only time. stdin interface: one games.csv path per line; `reset` clears cache; `quit` exits. |
 | **Lite mode** | Scalars-only (10 floats/move), 100x smaller output — ideal for rank inference pipelines. |
-| **HumanSL rank anchor (v2)** | Optional second pass (`-human-model`): loss-gated moves scored at 5 fixed profiles, spline posterior over 20k–9d → rank mean / sd per player. |
+| **HumanSL rank anchor (v3)** | Optional second pass (`-human-model`): loss-gated moves scored at 7 coarse profiles plus ±2 around the coarse estimate, spline posterior over 20k–9d → rank mean / sd per player. |
 | **Trunk/Pick output** | `includeTrunk`/`includePick` flags in NNOutput; OpenCL backend reads trunk buffer from GPU. Zero performance impact when disabled. `batch_analysis` refuses to run with trunk on a backend that returns none. |
 | **Concurrency** | `-threads N` (default 16) evaluates positions concurrently; output is identical to a serial run. NN cache is off (each position is evaluated once). |
 | **SGF naming** | Output files named after the original SGF filename (not hex IDs). |
